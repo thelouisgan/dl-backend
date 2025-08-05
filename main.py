@@ -36,18 +36,56 @@ class QubitWebSocketClient:
         self.is_connected = False
 
     async def connect(self):
-        """Connect to Qubit WebSocket and subscribe to market data"""
         try:
+        # Simple connection without extra_headers for compatibility
             self.websocket = await websockets.connect(QUBIT_WS_URL)
             self.is_connected = True
+            print("Successfully connected to Qubit WebSocket")
 
-            # Subscribe to market contracts and tickers
+        # Subscribe to market data - try different subscription formats
             subscribe_message = {
                 "action": "sub",
                 "data": {},
                 "topic": "contracts.market"
             }
             await self.websocket.send(json.dumps(subscribe_message))
+            print(f"Sent subscription message: {subscribe_message}")
+
+        # Also try alternative subscription formats
+            alt_subscribe = {
+                "action": "subscribe", 
+                "topic": "market.ticker"
+            }
+            await self.websocket.send(json.dumps(alt_subscribe))
+            print(f"Sent alternative subscription: {alt_subscribe}")
+
+        # Start listening for messages
+            asyncio.create_task(self.listen_for_messages())
+
+        except Exception as e:
+            print(f"Failed to connect to Qubit WebSocket: {e}")
+            self.is_connected = False
+            
+            self.is_connected = True
+            print("Successfully connected to Qubit WebSocket")
+
+            # Subscribe to market data - let's try different subscription formats
+            # First try the original format
+            subscribe_message = {
+                "action": "sub",
+                "data": {},
+                "topic": "contracts.market"
+            }
+            await self.websocket.send(json.dumps(subscribe_message))
+            print(f"Sent subscription message: {subscribe_message}")
+
+            # Also try alternative subscription formats that might be needed
+            alt_subscribe = {
+                "action": "subscribe",
+                "topic": "market.ticker"
+            }
+            await self.websocket.send(json.dumps(alt_subscribe))
+            print(f"Sent alternative subscription: {alt_subscribe}")
 
             # Start listening for messages
             asyncio.create_task(self.listen_for_messages())
@@ -58,31 +96,61 @@ class QubitWebSocketClient:
 
     async def listen_for_messages(self):
         """Listen for incoming WebSocket messages and store market data"""
+        global market_data
+        
         try:
             async for message in self.websocket:
                 try:
+                    print(f"Raw WebSocket message: {message}")  # Debug
                     data = json.loads(message)
-
-                    # Handle market ticker updates
-                    if data.get("topic") == "market.ticker":
-                        ticker_data = data.get("data", {})
-                        if "contract_code" in ticker_data:
-                            contract_code = ticker_data["contract_code"]
+                    print(f"Parsed WebSocket data: {data}")  # Debug
+                    
+                    # Check what topics/structure we're actually getting
+                    topic = data.get("topic") or data.get("type") or data.get("event")
+                    print(f"Message topic/type: {topic}")
+                    
+                    # Handle different possible message formats
+                    if topic == "market.ticker" or topic == "ticker":
+                        ticker_data = data.get("data", data)
+                        print(f"Processing ticker data: {ticker_data}")
+                        
+                        # Look for contract/symbol identifiers
+                        contract_code = (ticker_data.get("contract_code") or 
+                                       ticker_data.get("symbol") or 
+                                       ticker_data.get("pair"))
+                        
+                        if contract_code:
                             market_data[contract_code] = ticker_data
+                            print(f"Stored ticker data for {contract_code}")
 
-                    # Handle contract applies (price updates)
-                    elif data.get("topic") == "contract.applies":
-                        contract_data = data.get("data", {})
-                        if "contract_code" in contract_data:
-                            contract_code = contract_data["contract_code"]
-                            # Update existing data or create new entry
+                    elif topic == "contract.applies" or topic == "price":
+                        contract_data = data.get("data", data)
+                        print(f"Processing contract/price data: {contract_data}")
+                        
+                        contract_code = (contract_data.get("contract_code") or 
+                                       contract_data.get("symbol") or 
+                                       contract_data.get("pair"))
+                        
+                        if contract_code:
                             if contract_code in market_data:
                                 market_data[contract_code].update(contract_data)
                             else:
                                 market_data[contract_code] = contract_data
+                            print(f"Updated price data for {contract_code}")
+                    
+                    # Handle any other message types
+                    else:
+                        print(f"Unhandled message type '{topic}': {data}")
+                        # Store raw data to see what we're getting
+                        if "symbol" in data or "contract_code" in data or "pair" in data:
+                            symbol = data.get("symbol") or data.get("contract_code") or data.get("pair")
+                            market_data[f"raw_{symbol}"] = data
+                            print(f"Stored raw data for {symbol}")
 
-                except json.JSONDecodeError:
-                    print(f"Failed to parse WebSocket message: {message}")
+                except json.JSONDecodeError as e:
+                    print(f"Failed to parse WebSocket message: {message}, Error: {e}")
+                except Exception as e:
+                    print(f"Error processing message: {e}")
 
         except websockets.exceptions.ConnectionClosed:
             print("WebSocket connection closed")
@@ -96,6 +164,7 @@ class QubitWebSocketClient:
         if self.websocket:
             await self.websocket.close()
             self.is_connected = False
+            print("Disconnected from WebSocket")
 
 
 # Initialize WebSocket client
