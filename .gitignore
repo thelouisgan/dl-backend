@@ -179,3 +179,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# MacOS
+.DS_store
+.localized
+.Spotlight-V100
+.Trashes
+.fseventsd
