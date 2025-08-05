@@ -1,13 +1,14 @@
-# Crispy2test
-
-from fastapi import FastAPI
+#he
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import json
 import asyncio
 import websockets
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -24,254 +25,207 @@ deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
 # === Setup FastAPI app ===
 app = FastAPI()
 
+# Enable CORS for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # === Qubit WebSocket Configuration ===
 QUBIT_WS_URL = "wss://api.tgx.finance/v1/ws/"
+ORIGIN_HEADER = "https://test.qb.finance"
 
-# Global storage for market data
 market_data: Dict[str, Dict] = {}
-ws_connection = None
-
+last_updated: Dict[str, datetime] = {}
 
 class QubitWebSocketClient:
     def __init__(self):
         self.websocket = None
         self.is_connected = False
+        self.ping_interval = 15
+        self.reconnect_delay = 5
+        self.active_subscriptions: List[Dict] = []
 
     async def connect(self):
-        try:
-        # Simple connection without extra_headers for compatibility
-            self.websocket = await websockets.connect(QUBIT_WS_URL)
-            self.is_connected = True
-            print("Successfully connected to Qubit WebSocket")
+        while True:
+            try:
+                self.websocket = await websockets.connect(
+                    QUBIT_WS_URL,
+                    ping_interval=self.ping_interval,
+                    extra_headers={"Origin": ORIGIN_HEADER}
+                )
+                self.is_connected = True
+                print("✅ Connected to Qubit WebSocket")
 
-        # Subscribe to market data - try different subscription formats
-            subscribe_message = {
+                await self.resubscribe()
+
+                asyncio.create_task(self.listen_for_messages())
+                asyncio.create_task(self.send_pings())
+                return
+
+            except Exception as e:
+                print(f"❌ Connection failed: {e}. Retrying in {self.reconnect_delay}s...")
+                self.is_connected = False
+                await asyncio.sleep(self.reconnect_delay)
+
+    async def subscribe(self, contract_code: str, topics: List[str]):
+        for topic in topics:
+            subscription = {
                 "action": "sub",
-                "data": {},
-                "topic": "contracts.market"
+                "data": {"contract_code": contract_code},
+                "topic": topic
             }
-            await self.websocket.send(json.dumps(subscribe_message))
-            print(f"Sent subscription message: {subscribe_message}")
+            await self.websocket.send(json.dumps(subscription))
+            self.active_subscriptions.append(subscription)
+            print(f"🔔 Subscribed to {topic} for {contract_code}")
 
-        # Also try alternative subscription formats
-            alt_subscribe = {
-                "action": "subscribe", 
-                "topic": "market.ticker"
-            }
-            await self.websocket.send(json.dumps(alt_subscribe))
-            print(f"Sent alternative subscription: {alt_subscribe}")
+    async def resubscribe(self):
+        for sub in self.active_subscriptions:
+            await self.websocket.send(json.dumps(sub))
+            print(f"🔄 Resubscribed to {sub['topic']}")
 
-        # Start listening for messages
-            asyncio.create_task(self.listen_for_messages())
-
-        except Exception as e:
-            print(f"Failed to connect to Qubit WebSocket: {e}")
-            self.is_connected = False
-            
-            self.is_connected = True
-            print("Successfully connected to Qubit WebSocket")
-
-            # Subscribe to market data - let's try different subscription formats
-            # First try the original format
-            subscribe_message = {
-                "action": "sub",
-                "data": {},
-                "topic": "contracts.market"
-            }
-            await self.websocket.send(json.dumps(subscribe_message))
-            print(f"Sent subscription message: {subscribe_message}")
-
-            # Also try alternative subscription formats that might be needed
-            alt_subscribe = {
-                "action": "subscribe",
-                "topic": "market.ticker"
-            }
-            await self.websocket.send(json.dumps(alt_subscribe))
-            print(f"Sent alternative subscription: {alt_subscribe}")
-
-            # Start listening for messages
-            asyncio.create_task(self.listen_for_messages())
-
-        except Exception as e:
-            print(f"Failed to connect to Qubit WebSocket: {e}")
-            self.is_connected = False
+    async def send_pings(self):
+        while self.is_connected:
+            try:
+                await self.websocket.send("ping")
+                await asyncio.sleep(self.ping_interval)
+            except Exception as e:
+                print(f"⚠️ Ping failed: {e}")
+                self.is_connected = False
+                break
 
     async def listen_for_messages(self):
-        """Listen for incoming WebSocket messages and store market data"""
-        global market_data
-        
-        try:
-            async for message in self.websocket:
-                try:
-                    print(f"Raw WebSocket message: {message}")  # Debug
-                    data = json.loads(message)
-                    print(f"Parsed WebSocket data: {data}")  # Debug
-                    
-                    # Check what topics/structure we're actually getting
-                    topic = data.get("topic") or data.get("type") or data.get("event")
-                    print(f"Message topic/type: {topic}")
-                    
-                    # Handle different possible message formats
-                    if topic == "market.ticker" or topic == "ticker":
-                        ticker_data = data.get("data", data)
-                        print(f"Processing ticker data: {ticker_data}")
-                        
-                        # Look for contract/symbol identifiers
-                        contract_code = (ticker_data.get("contract_code") or 
-                                       ticker_data.get("symbol") or 
-                                       ticker_data.get("pair"))
-                        
-                        if contract_code:
-                            market_data[contract_code] = ticker_data
-                            print(f"Stored ticker data for {contract_code}")
+        global market_data, last_updated
 
-                    elif topic == "contract.applies" or topic == "price":
-                        contract_data = data.get("data", data)
-                        print(f"Processing contract/price data: {contract_data}")
-                        
-                        contract_code = (contract_data.get("contract_code") or 
-                                       contract_data.get("symbol") or 
-                                       contract_data.get("pair"))
-                        
-                        if contract_code:
-                            if contract_code in market_data:
-                                market_data[contract_code].update(contract_data)
-                            else:
-                                market_data[contract_code] = contract_data
-                            print(f"Updated price data for {contract_code}")
-                    
-                    # Handle any other message types
-                    else:
-                        print(f"Unhandled message type '{topic}': {data}")
-                        # Store raw data to see what we're getting
-                        if "symbol" in data or "contract_code" in data or "pair" in data:
-                            symbol = data.get("symbol") or data.get("contract_code") or data.get("pair")
-                            market_data[f"raw_{symbol}"] = data
-                            print(f"Stored raw data for {symbol}")
+        while self.is_connected:
+            try:
+                message = await self.websocket.recv()
+                data = json.loads(message)
 
-                except json.JSONDecodeError as e:
-                    print(f"Failed to parse WebSocket message: {message}, Error: {e}")
-                except Exception as e:
-                    print(f"Error processing message: {e}")
+                print(f"📩 Received message: {data.get('topic')}")
 
-        except websockets.exceptions.ConnectionClosed:
-            print("WebSocket connection closed")
-            self.is_connected = False
-        except Exception as e:
-            print(f"Error in WebSocket listener: {e}")
-            self.is_connected = False
+                if data.get("action") == "notify":
+                    topic = data.get("topic")
+                    contract_code = data.get("data", {}).get("contract_code")
+
+                    if not contract_code:
+                        continue
+
+                    market_data[contract_code] = data.get("data", {})
+                    last_updated[contract_code] = datetime.now()
+
+                    if topic == "market.ticker":
+                        print(f"📊 Updated ticker for {contract_code}")
+
+            except websockets.exceptions.ConnectionClosed:
+                print("🔌 WebSocket connection closed")
+                self.is_connected = False
+            except json.JSONDecodeError:
+                print(f"⚠️ Non-JSON message: {message}")
+            except Exception as e:
+                print(f"⚠️ Error processing message: {e}")
+                self.is_connected = False
 
     async def disconnect(self):
-        """Disconnect from WebSocket"""
         if self.websocket:
             await self.websocket.close()
             self.is_connected = False
-            print("Disconnected from WebSocket")
+            print("🔌 Disconnected from WebSocket")
 
-
-# Initialize WebSocket client
 qubit_client = QubitWebSocketClient()
-
 
 @app.on_event("startup")
 async def startup_event():
-    """Connect to Qubit WebSocket on startup"""
     await qubit_client.connect()
-
+    await qubit_client.subscribe("BTCUSDT", ["market.ticker", "contracts.market"])
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Disconnect from WebSocket on shutdown"""
     await qubit_client.disconnect()
 
-
 def normalize_symbol(symbol: str) -> str:
-    """Normalize symbol format (e.g., BTC/USDT -> BTCUSDT)"""
-    return symbol.upper().replace("/", "")
+    return symbol.upper().replace("/", "").replace("-", "")
 
+def is_data_fresh(symbol: str, max_age: int = 30) -> bool:
+    normalized = normalize_symbol(symbol)
+    if normalized not in last_updated:
+        return False
+    return (datetime.now() - last_updated[normalized]) < timedelta(seconds=max_age)
 
 @tool
 def get_crypto_price(symbol: str) -> str:
-    """
-    Get the current price of a cryptocurrency from Qubit.
-    Example symbols: 'BTC/USDT', 'ETH/USDT', 'BTCUSDT'
-    """
     try:
-        normalized_symbol = normalize_symbol(symbol)
+        normalized = normalize_symbol(symbol)
 
-        if normalized_symbol not in market_data:
-            return f"No price data available for {symbol}. Available symbols: {list(market_data.keys())}"
+        if not is_data_fresh(normalized):
+            return f"⚠️ Data for {symbol} is stale (>30 seconds old)"
 
-        data = market_data[normalized_symbol]
+        if normalized not in market_data:
+            return f"❌ No data for {symbol}. Available: {list(market_data.keys())}"
 
-        # Try to get price from various possible fields
-        price = None
-        if "last_price" in data:
-            price = data["last_price"]
-        elif "price" in data:
-            price = data["price"]
-        elif "mark_price" in data:
-            price = data["mark_price"]
+        data = market_data[normalized]
+        price_fields = ["last_price", "price", "mark_price", "close"]
 
-        if price is not None:
-            return f"The current price of {symbol.upper()} is {price} USDT."
-        else:
-            return f"Price data found for {symbol} but no price field available. Data: {data}"
+        for field in price_fields:
+            if field in data:
+                return f"💵 {symbol}: {data[field]} USDT"
+
+        return f"⚠️ No price field found for {symbol}. Data: {data}"
 
     except Exception as e:
-        return f"Error fetching price for {symbol}: {e}"
-
+        return f"❌ Error fetching price: {str(e)}"
 
 @tool
 def get_crypto_info(symbol: str) -> str:
-    """
-    Get detailed ticker info for a cryptocurrency pair from Qubit.
-    Example symbols: 'BTC/USDT', 'ETH/USDT', 'BTCUSDT'
-    """
     try:
-        normalized_symbol = normalize_symbol(symbol)
+        normalized = normalize_symbol(symbol)
 
-        if normalized_symbol not in market_data:
-            return f"No data available for {symbol}. Available symbols: {list(market_data.keys())}"
+        if not is_data_fresh(normalized):
+            return f"⚠️ Data for {symbol} is stale (>30 seconds old)"
 
-        data = market_data[normalized_symbol]
+        if normalized not in market_data:
+            return f"❌ No data for {symbol}"
 
-        # Build comprehensive info string
-        info_lines = [f"Symbol: {symbol.upper()}"]
+        data = market_data[normalized]
+        info = [f"📊 {symbol.upper()} Market Data"]
 
-        # Add available data fields
-        field_mappings = {
-            "last_price": "Last Price",
-            "price": "Price",
-            "mark_price": "Mark Price",
+        fields = {
+            "last_price": "Price",
             "high_price": "24h High",
             "low_price": "24h Low",
-            "change": "24h Change",
-            "change_ratio": "24h Change %",
             "volume": "Volume",
-            "turnover": "Turnover"
+            "change": "Change",
+            "change_ratio": "Change %"
         }
 
-        for field, label in field_mappings.items():
+        for field, label in fields.items():
             if field in data:
-                value = data[field]
-                if field == "change_ratio":
-                    info_lines.append(f"{label}: {value}%")
-                else:
-                    info_lines.append(f"{label}: {value}")
+                value = f"{data[field]}%" if field == "change_ratio" else data[field]
+                info.append(f"{label}: {value}")
 
-        return "\n".join(info_lines)
+        if normalized in last_updated:
+            info.append(f"\n⏰ Updated: {last_updated[normalized].strftime('%Y-%m-%d %H:%M:%S')}")
+
+        return "\n".join(info)
 
     except Exception as e:
-        return f"Error fetching details for {symbol}: {e}"
+        return f"❌ Error fetching info: {str(e)}"
 
+@app.get("/subscribe/{contract_code}")
+async def subscribe_to_contract(contract_code: str):
+    if not qubit_client.is_connected:
+        raise HTTPException(status_code=503, detail="WebSocket not connected")
 
-# === Streaming API Endpoint ===
+    await qubit_client.subscribe(contract_code, ["market.ticker", "contracts.market"])
+    return {"status": "subscribed", "contract": contract_code}
+
 @app.get("/ask")
 async def ask_stream(user_input: str):
-    def generate_response():
+    async def generate_response():
         try:
-            # Create LLM
             client = AzureChatOpenAI(
                 azure_endpoint=endpoint,
                 azure_deployment=deployment,
@@ -280,138 +234,59 @@ async def ask_stream(user_input: str):
             )
             client_with_tools = client.bind_tools([get_crypto_info, get_crypto_price])
 
-            # System and user prompt
-            messages_with_tools = [
-                SystemMessage("You are a helpful assistant that can pull current crypto data from Qubit exchange."),
+            messages = [
+                SystemMessage("You're a crypto assistant with real-time Qubit exchange data."),
                 HumanMessage(user_input),
             ]
 
-            # Run LangChain agent to check for tool calls
-            result = client_with_tools.invoke(messages_with_tools)
-            messages_with_tools.append(result)
+            result = await client_with_tools.ainvoke(messages)
+            messages.append(result)
 
-            # Process tool calls if any
             if result.tool_calls:
                 for tool_call in result.tool_calls:
-                    # Emit tool call info - properly escape JSON
-                    tool_data = {
+                    yield json.dumps({
                         "type": "tool_call",
-                        "id": tool_call["id"],
                         "name": tool_call["name"],
                         "args": tool_call["args"]
-                    }
-                    yield f'{json.dumps([tool_data])}\n'
+                    }) + "\n"
 
-                    # Execute tool
-                    tool_fn = {
-                        "get_crypto_info": get_crypto_info,
-                        "get_crypto_price": get_crypto_price
-                    }[tool_call["name"]]
+                    tool_fn = globals()[tool_call["name"]]
+                    tool_result = tool_fn(**tool_call["args"])
 
-                    tool_result = tool_fn.invoke(tool_call)
-                    tool_message = ToolMessage(
+                    messages.append(ToolMessage(
                         content=tool_result,
                         tool_call_id=tool_call["id"]
-                    )
-                    messages_with_tools.append(tool_message)
+                    ))
 
-            # Generate final response with streaming
-            message_id = f"msg-{abs(hash(user_input)) % 10000}"
+                    yield json.dumps({
+                        "type": "tool_result",
+                        "content": tool_result
+                    }) + "\n"
 
-            # First, let's collect all streaming chunks to avoid broken JSON
-            collected_content = ""
-            for chunk in client_with_tools.stream(messages_with_tools):
+            async for chunk in client_with_tools.astream(messages):
                 if chunk.content:
-                    collected_content += chunk.content
-                    # Send each character/token individually but as complete JSON
-                    chunk_data = {
+                    yield json.dumps({
                         "type": "text",
-                        "id": message_id,
-                        "data": chunk.content
-                    }
-                    yield f'{json.dumps([chunk_data])}\n'
+                        "content": chunk.content
+                    }) + "\n"
 
         except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            error_data = {
-                "type": "text",
-                "id": f"error-{abs(hash(str(e))) % 1000}",
-                "data": error_msg
-            }
-            yield f'{json.dumps([error_data])}\n'
+            yield json.dumps({
+                "type": "error",
+                "content": f"Error: {str(e)}"
+            }) + "\n"
 
     return StreamingResponse(
         generate_response(),
-        media_type="text/plain",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"}
     )
 
-
-# === Non-streaming endpoint for compatibility ===
-@app.get("/ask_simple")
-async def ask_simple(user_input: str):
-    try:
-        # Create LLM
-        client = AzureChatOpenAI(
-            azure_endpoint=endpoint,
-            azure_deployment=deployment,
-            openai_api_version=api_version,
-            api_key=azure_api_key,
-        )
-        client_with_tools = client.bind_tools([get_crypto_info, get_crypto_price])
-
-        # System and user prompt
-        messages_with_tools = [
-            SystemMessage("You are a helpful assistant that can pull current crypto data from Qubit exchange."),
-            HumanMessage(user_input),
-        ]
-
-        # Run LangChain agent
-        result = client_with_tools.invoke(messages_with_tools)
-        messages_with_tools.append(result)
-
-        tool_outputs = []
-        if result.tool_calls:
-            for tool_call in result.tool_calls:
-                tool_fn = {
-                    "get_crypto_info": get_crypto_info,
-                    "get_crypto_price": get_crypto_price
-                }[tool_call["name"]]
-
-                tool_result = tool_fn.invoke(tool_call)
-                tool_outputs.append(tool_result)
-
-                tool_message = ToolMessage(
-                    content=tool_result,
-                    tool_call_id=tool_call["id"]
-                )
-                messages_with_tools.append(tool_message)
-
-        # Final response
-        final_response = client_with_tools.invoke(messages_with_tools)
-
-        return {
-            "response": final_response.content,
-            "tool_outputs": tool_outputs
-        }
-
-    except Exception as e:
-        return {
-            "error": str(e),
-            "response": f"Error: {str(e)}",
-            "tool_outputs": []
-        }
-
-
-# === Debug endpoint to see available market data ===
 @app.get("/market_data")
 async def get_market_data():
-    """Debug endpoint to see what market data is available"""
     return {
         "connected": qubit_client.is_connected,
-        "available_symbols": list(market_data.keys()),
-        "sample_data": {k: v for k, v in list(market_data.items())[:3]}  # Show first 3 entries
+        "subscriptions": qubit_client.active_subscriptions,
+        "available_contracts": list(market_data.keys()),
+        "last_updated": {k: v.isoformat() for k, v in last_updated.items()}
     }
