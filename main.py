@@ -1,4 +1,4 @@
-#Crispy2testingv10000
+#crispy2cookies675
 
 #!/usr/bin/env python3
 import os
@@ -47,7 +47,10 @@ load_dotenv()
 config = {
     "ws_url": os.getenv("WS_URL", "wss://api.tgx.finance/v1/ws/"),
     "ping_interval": int(os.getenv("WS_PING_INTERVAL", "30")),
-    "default_port": int(os.getenv("PORT", "8001")),
+    "ping_timeout": int(os.getenv("WS_PING_TIMEOUT", "10")),
+    "close_timeout": int(os.getenv("WS_CLOSE_TIMEOUT", "10")),
+    "heartbeat_interval": int(os.getenv("HEARTBEAT_INTERVAL", "25")),
+    "default_port": int(os.getenv("PORT", "8000")),  # Changed to 8000 to match frontend
     "port_range": 100,
     "ssl_enabled": os.getenv("SSL_ENABLED", "true").lower() == "true",
     "max_reconnect_attempts": 5,
@@ -88,15 +91,24 @@ class TGXWebSocketManager:
             "price_history": [],
             "connection_status": "disconnected",
             "last_update": None,
-            "message_count": 0
+            "message_count": 0,
+            "latest_raw_message": {}
         }
         self._reconnect_task = None
         self._heartbeat_task = None
 
     async def connect(self):
         if self.connected and self.connection is not None:
-            logger.info("Already connected to TGX Finance!")
-            return
+            # Check if connection is still alive
+            try:
+                if hasattr(self.connection, 'closed') and not self.connection.closed:
+                    logger.info("Already connected to TGX Finance!")
+                    return
+            except AttributeError:
+                # Handle the 'ClientConnection' object has no attribute 'closed' error
+                logger.warning("Connection object doesn't have 'closed' attribute, reconnecting...")
+                self.connected = False
+                self.connection = None
 
         max_retries = config["max_reconnect_attempts"]
         retry_count = 0
@@ -104,177 +116,107 @@ class TGXWebSocketManager:
         while retry_count < max_retries and not self._stop_event.is_set():
             try:
                 logger.info(f"Connecting to TGX Finance WebSocket: {config['ws_url']} (attempt {retry_count + 1})")
-            # Create SSL context
+                
+                # Create SSL context
                 ssl_context = None
                 if config["ssl_enabled"]:
                     ssl_context = ssl.create_default_context()
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
 
-            # Connect without extra_headers
+                # Connect with proper timeout settings
                 self.connection = await websockets.connect(
                     config["ws_url"],
-                    ping_interval=config.get("ping_interval", 20),
-                    ping_timeout=config.get("ping_timeout", 10),
+                    ping_interval=config["ping_interval"],
+                    ping_timeout=config["ping_timeout"],
                     ssl=ssl_context if config["ssl_enabled"] else None,
-                    close_timeout=config.get("close_timeout", 10)
+                    close_timeout=config["close_timeout"]
                 )
+                
                 self.connected = True
-            
-            # Update market data connection status
                 self._market_data["connection_status"] = "connected"
                 logger.info("✅ Connected to TGX Finance successfully!")
 
-            # Start tasks with correct method names
-                
-            
-            # Subscribe to feeds
+                # Subscribe to feeds
                 await self._subscribe_to_all_feeds()
-            
-            # Listen for messages
+                
+                # Start heartbeat task
+                if self._heartbeat_task is None or self._heartbeat_task.done():
+                    self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                
+                # Listen for messages
                 await self._listen_messages()
                 break
-            
+                
             except Exception as e:
                 self.connected = False
                 self.connection = None
+                self._market_data["connection_status"] = "disconnected"
                 logger.error(f"Connection failed: {e}")
                 retry_count += 1
                 if retry_count < max_retries:
-                    await asyncio.sleep(2)  # Wait before retry
+                    await asyncio.sleep(config["reconnect_delay"])
 
     async def _heartbeat_loop(self):
+        """Send periodic heartbeats to keep connection alive"""
         try:
-            while True:
-                await asyncio.sleep(config.get("heartbeat_interval", 25))
+            while self.connected and not self._stop_event.is_set():
+                await asyncio.sleep(config["heartbeat_interval"])
                 if self.connection and self.connected:
-                    await self.connection.ping()
-                    logger.debug("💗 Heartbeat sent")
-        except Exception as e:
-            logger.warning(f"Heartbeat error: {e}")
-            await self._cleanup_connection()
-        
-    async def _subscribe_to_all_feeds(self):
-        try:
-            subscriptions = [
-                {
-                    "action": "sub",
-                    "topic": "market.ticker",
-                    "params": {"contract_code": "BTCUSDT"}
-                },
-                {
-                    "action": "sub", 
-                    "topic": "market.contract",
-                    "params": {"contract_code": "BTCUSDT"}
-                },
-                {
-                    "action": "sub",
-                    "topic": "market.depth",
-                    "params": {"contract_code": "BTCUSDT"}
-                }
-            ]
-
-            for sub in subscriptions:
-                if self.connection and self.connected:
-                    await self.connection.send(json.dumps(sub))
-                    logger.info(f"Subscribed to: {sub['topic']}")
-                    await asyncio.sleep(0.2)
-                
-        except Exception as e:
-            logger.error(f"Subscription error: {e}")
-
-    async def _listen_messages(self):
-        consecutive_errors = 0
-        max_retries = config.get("max_reconnect_attempts", 5)
-        retry_count = 0
-    
-        try:
-            async for message in self.connection:
-                try:
-                    # Process the message here
-                    logger.info(f"Received message: {message}")
-                    consecutive_errors = 0  # Reset on successful message
-                
-                except Exception as e:
-                    consecutive_errors += 1
-                    logger.error(f"Message processing error: {e}")
-                
-                    if consecutive_errors > 10:
-                        logger.error("Too many consecutive errors, disconnecting")
+                    try:
+                        # Check if connection has closed attribute and use it safely
+                        if hasattr(self.connection, 'closed'):
+                            if not self.connection.closed:
+                                await self.connection.ping()
+                                logger.debug("💗 Heartbeat sent")
+                            else:
+                                logger.warning("Connection is closed, stopping heartbeat")
+                                break
+                        else:
+                            # If no closed attribute, just try to ping
+                            await self.connection.ping()
+                            logger.debug("💗 Heartbeat sent")
+                    except Exception as e:
+                        logger.warning(f"Heartbeat ping failed: {e}")
                         break
-                    
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("WebSocket connection closed")
         except Exception as e:
-            logger.error(f"Listen error: {e}")
-
+            logger.error(f"Heartbeat loop error: {e}")
         finally:
             await self._cleanup_connection()
-                
-        if retry_count < max_retries:
-            delay = config["reconnect_delay"] * (2 ** (retry_count - 1))
-            logger.info(f"Retrying in {delay:.1f}s...")
-            await asyncio.sleep(delay)
-            retry_count += 1
-
-        self._market_data["connection_status"] = "failed"
-        logger.error("❌ Maximum connection attempts reached")
-
-
-
-    async def _cleanup_connection(self):
-        """Clean up any existing connection"""
-        if self.connection:
-            await self.connection.close()
-        self.connected = False
-        self._market_data["connection_status"] = "disconnected"
-
-    async def _heartbeat_loop(self):
-        while self.connected and not self._stop_event.is_set():
-            try:
-                await asyncio.sleep(config.get("heartbeat_interval", 25))
-                if self.connection and self.connected:
-                    await self.connection.ping()
-                    logger.debug("♥️ Heartbeat sent")
-            except Exception as e:
-                logger.warning(f"Heartbeat error: {e}")
-                await self._cleanup_connection()
-                break
 
     async def _subscribe_to_all_feeds(self):
+        """Subscribe to all TGX Finance data feeds"""
         try:
             logger.info("Starting subscription process...")
-            logger.info(f"Connection state: {self.connected}, Connection object: {self.connection}")
             subscriptions = [
                 {
                     "action": "sub",
                     "topic": "market.ticker",
-                    "params": {"contract_code": "BTCUSDT"}  # Changed "data" → "params"
+                    "params": {"contract_code": "BTCUSDT"}
                 },
                 {
                     "action": "sub",
                     "topic": "market.contract",
-                    "params": {"contract_code": "BTCUSDT"}  # Changed structure
+                    "params": {"contract_code": "BTCUSDT"}
                 },
                 {
                     "action": "sub",
                     "topic": "market.depth",
-                    "params": {"contract_code": "BTCUSDT"}  # Simplified
+                    "params": {"contract_code": "BTCUSDT"}
                 }
             ]
-        
+
             for sub in subscriptions:
                 if self.connection and self.connected:
-                    await self.connection.send(json.dumps(sub))
-                    logger.info(f"Subscribed to: {sub['topic']}")
-                    await asyncio.sleep(0.2)
-                else:
-                    logger.error(f"Cannot subscribe - connection: {self.connection}, connected: {self.connected}")
-                
+                    try:
+                        await self.connection.send(json.dumps(sub))
+                        logger.info(f"Subscribed to: {sub['topic']}")
+                        await asyncio.sleep(0.2)
+                    except Exception as e:
+                        logger.error(f"Failed to subscribe to {sub['topic']}: {e}")
+                        
         except Exception as e:
             logger.error(f"Subscription error: {e}")
-            logger.error(f"Exception type: {type(e)}")
-            raise
 
     async def _listen_messages(self):
         """Listen for incoming messages with robust error handling"""
@@ -284,6 +226,7 @@ class TGXWebSocketManager:
         try:
             while not self._stop_event.is_set() and self.connected:
                 try:
+                    # Use asyncio.wait_for to add timeout
                     message = await asyncio.wait_for(
                         self.connection.recv(), 
                         timeout=60.0
@@ -293,9 +236,17 @@ class TGXWebSocketManager:
                     await self._process_tgx_message(message)
                     
                 except asyncio.TimeoutError:
-                    logger.debug("Message receive timeout - sending ping")
-                    if self.connection and not self.connection.closed:
-                        await self.connection.ping()
+                    logger.debug("Message receive timeout - checking connection")
+                    if self.connection:
+                        try:
+                            # Check if connection is still alive
+                            if hasattr(self.connection, 'closed') and self.connection.closed:
+                                logger.warning("Connection closed during timeout")
+                                break
+                            await self.connection.ping()
+                        except:
+                            logger.warning("Ping failed during timeout")
+                            break
                         
                 except websockets.exceptions.ConnectionClosed:
                     logger.warning("📤 TGX Finance WebSocket connection closed")
@@ -316,8 +267,7 @@ class TGXWebSocketManager:
         except Exception as e:
             logger.error(f"Critical error in message listener: {e}")
         finally:
-            self.connected = False
-            self._market_data["connection_status"] = "disconnected"
+            await self._cleanup_connection()
             if not self._stop_event.is_set():
                 logger.info("🔄 Scheduling reconnection...")
                 asyncio.create_task(self._reconnect_with_delay())
@@ -328,8 +278,8 @@ class TGXWebSocketManager:
             data = json.loads(message)
             self._market_data["message_count"] += 1
             self._market_data["last_update"] = datetime.now().isoformat()
-        
-        # Skip if not a dictionary
+            
+            # Skip if not a dictionary
             if not isinstance(data, dict):
                 logger.debug(f"Received non-dict message: {str(data)[:100]}...")
                 return
@@ -337,49 +287,58 @@ class TGXWebSocketManager:
             topic = data.get('topic', 'unknown')
             action = data.get('action', 'unknown')
             msg_data = data.get('data', {})
-        
-        # Store raw message for debugging
+            
+            # Store raw message for debugging
             self._market_data["latest_raw_message"] = data
-        
-        # Handle different message types
+            
+            # Handle different message types
             if action == "notify":
                 if topic == "market.ticker":
                     if isinstance(msg_data, dict):
-                        self._market_data["btc_ticker"] = msg_data  # Replace instead of update
+                        self._market_data["btc_ticker"] = msg_data
                         if "price" in msg_data:
                             self._market_data["price_history"].append({
                                 "price": msg_data["price"],
                                 "timestamp": datetime.now().isoformat()
                             })
-                        # Keep only last 100 prices
+                            # Keep only last 100 prices
                             if len(self._market_data["price_history"]) > 100:
                                 self._market_data["price_history"] = self._market_data["price_history"][-100:]
-            
+                
                 elif topic == "market.contract" and isinstance(msg_data, dict):
                     self._market_data["contract_info"] = msg_data
-            
+                
                 elif topic == "market.depth" and isinstance(msg_data, dict):
                     self._market_data["market_depth"] = msg_data
-            
-                elif topic == "contracts.market" and isinstance(msg_data, dict):
-                    self._market_data["contract_info"] = msg_data
-        
-            logger.debug(f"Processed {topic} message")
+                
+                logger.debug(f"Processed {topic} message")
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON: {e}\nMessage: {message[:200]}...")
         except Exception as e:
-            logger.error(f"Processing error: {e}\nData: {str(data)[:200] if 'data' in locals() else 'N/A'}")
+            logger.error(f"Processing error: {e}")
 
     async def _reconnect_with_delay(self):
         """Reconnect after a delay"""
         await asyncio.sleep(config["reconnect_delay"])
-        await self.connect()
+        if not self._stop_event.is_set():
+            await self.connect()
+
+    async def _cleanup_connection(self):
+        """Clean up any existing connection"""
+        self.connected = False
+        if self.connection:
+            try:
+                if hasattr(self.connection, 'close'):
+                    await self.connection.close()
+            except:
+                pass
+        self.connection = None
+        self._market_data["connection_status"] = "disconnected"
 
     def get_market_summary(self) -> Dict[str, Any]:
         """Get a formatted market summary"""
         ticker = self._market_data.get("btc_ticker", {})
-        contract = self._market_data.get("contract_info", {})
         
         summary = {
             "symbol": ticker.get("contract_code", "BTCUSDT"),
@@ -410,11 +369,7 @@ class TGXWebSocketManager:
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
             
-        if self.connection and not self.connection.closed:
-            await self.connection.close()
-        
-        self.connected = False
-        self._market_data["connection_status"] = "disconnected"
+        await self._cleanup_connection()
         logger.info("✅ TGX Finance connection closed")
 
 # ===== AI Response Generator =====
@@ -454,6 +409,31 @@ class CryptoAI:
         else:
             return f"🤖 I'm your crypto assistant powered by live TGX Finance data! Current BTC: {format_price(str(market_data.get('price', 'N/A')))}. Ask me about prices, volume, ranges, or market analysis!"
 
+    async def generate_streaming_response(self, query: str):
+        """Generate streaming response in the format expected by frontend"""
+        try:
+            response_text = self.generate_response(query)
+            market_data = self.ws_manager.get_market_summary()
+            
+            # Create response in the expected format
+            response_obj = {
+                "type": "text",
+                "id": f"msg-{datetime.now().timestamp()}",
+                "data": response_text
+            }
+            
+            # Yield as JSON array (matching frontend expectation)
+            yield json.dumps([response_obj]) + "\n"
+            
+        except Exception as e:
+            logger.error(f"Streaming response error: {e}")
+            error_obj = {
+                "type": "text", 
+                "id": f"error-{datetime.now().timestamp()}",
+                "data": f"Sorry, there was an error processing your request: {str(e)}"
+            }
+            yield json.dumps([error_obj]) + "\n"
+
 # ===== FastAPI App Setup =====
 ws_manager = None
 crypto_ai = None
@@ -468,7 +448,8 @@ async def lifespan(app: FastAPI):
     ws_manager = TGXWebSocketManager()
     crypto_ai = CryptoAI(ws_manager)
     
-    await ws_manager.connect()
+    # Start connection in background task
+    asyncio.create_task(ws_manager.connect())
     
     app.state.ws_manager = ws_manager
     app.state.crypto_ai = crypto_ai
@@ -485,7 +466,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TGX Finance Crypto Assistant",
     description="Real-time cryptocurrency assistant powered by TGX Finance WebSocket feeds",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -499,9 +480,25 @@ app.add_middleware(
 
 # ===== API Endpoints =====
 
+@app.get("/ask")
+async def ask_question(user_input: str):
+    """Main ask endpoint with streaming response (matching frontend expectation)"""
+    if not crypto_ai:
+        return StreamingResponse(
+            iter([json.dumps([{"type": "text", "id": "error", "data": "AI service not initialized"}]) + "\n"]), 
+            media_type="text/plain"
+        )
+    
+    logger.info(f"💬 Received query: '{user_input}'")
+    
+    return StreamingResponse(
+        crypto_ai.generate_streaming_response(user_input),
+        media_type="text/plain"
+    )
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
-    """Main chat endpoint for frontend compatibility"""
+    """Alternative chat endpoint for JSON requests"""
     try:
         if not crypto_ai:
             raise HTTPException(status_code=503, detail="AI service not initialized")
@@ -521,37 +518,6 @@ async def chat_endpoint(request: ChatRequest):
     except Exception as e:
         logger.error(f"Chat endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"Chat service error: {str(e)}")
-
-@app.get("/ask")
-async def ask_question(query: str):
-    """Legacy ask endpoint with streaming response"""
-    async def generate():
-        try:
-            if not crypto_ai:
-                yield json.dumps({"error": "AI service not initialized"}) + "\n"
-                return
-            
-            ai_response = crypto_ai.generate_response(query)
-            market_data = ws_manager.get_market_summary() if ws_manager else {}
-            
-            response_data = {
-                "query": query,
-                "response": ai_response,
-                "market_data": market_data,
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            yield json.dumps(response_data) + "\n"
-            
-        except Exception as e:
-            logger.error(f"Ask endpoint error: {e}")
-            error_data = {
-                "error": str(e), 
-                "timestamp": datetime.now().isoformat()
-            }
-            yield json.dumps(error_data) + "\n"
-
-    return StreamingResponse(generate(), media_type="application/json")
 
 @app.get("/market-data")
 async def get_market_data():
@@ -605,20 +571,19 @@ async def root():
     """API documentation root"""
     return {
         "title": "TGX Finance Crypto Assistant API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "description": "Real-time crypto assistant with live TGX Finance data",
         "endpoints": {
             "/": "API documentation",
             "/health": "Health check and service status",
             "/market-data": "Live market data from TGX Finance",
-            "/ask?query=<question>": "Ask crypto questions (streaming)",
+            "/ask?user_input=<question>": "Ask crypto questions (streaming)",
             "/api/chat": "Main chat endpoint (POST with JSON)"
         },
         "websocket_status": ws_manager.connected if ws_manager else False,
         "market_feeds": [
             "market.ticker",
             "market.contract", 
-            "contracts.market",
             "market.depth"
         ]
     }
