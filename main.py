@@ -9,6 +9,9 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import AzureChatOpenAI
 
+# Import your Jesse tools
+from jesse_tools import get_crypto_historical_analysis, get_crypto_raw_historical_data
+
 # === Load Environment Variables ===
 load_dotenv(dotenv_path=os.path.join("config", ".env"))
 
@@ -67,11 +70,47 @@ async def ask_stream(user_input: str):
                 openai_api_version=api_version,
                 api_key=azure_api_key,
             )
-            client_with_tools = client.bind_tools([get_crypto_info, get_crypto_price])
+            
+            # Bind all tools including Jesse tools
+            client_with_tools = client.bind_tools([
+                get_crypto_info, 
+                get_crypto_price,
+                get_crypto_historical_analysis,
+                get_crypto_raw_historical_data
+            ])
+            
+            # Enhanced system prompt with correct UP/DOWN tag formatting
+            system_prompt = """You are a crypto analysis assistant with access to:
+1. Real-time crypto prices (get_crypto_price, get_crypto_info)
+2. Historical price analysis from Jesse.ai database (get_crypto_historical_analysis)
+3. Raw historical data (get_crypto_raw_historical_data)
+
+CRITICAL FORMATTING RULES:
+- For price increases: Use <UP>**X.XX%** (increase)</UP>
+- For price decreases: Use <DOWN>**X.XX%** (decrease)</DOWN>
+- NEVER use other formats like "UP +X%" or "DOWN -X%"
+- Always include "**" around the percentage and "(increase)" or "(decrease)" text
+- Only use UP/DOWN tags for percentage changes, not for other text
+
+CORRECT EXAMPLE:
+* 24 hours: <UP>**3.98%** (increase)</UP>
+* 7 days: <DOWN>**3.45%** (decrease)</DOWN>
+
+INCORRECT EXAMPLES (DO NOT USE):
+* 24 hours: UP +3.98%
+* 7 days: DOWN -3.45%
+* 24 hours: <UP>+3.98%</UP>
+
+When users ask about:
+- Current prices: Use get_crypto_price or get_crypto_info
+- Price history/trends/performance: Use get_crypto_historical_analysis (this provides data in emoji format, convert it to UP/DOWN tags)
+- Historical data for charts: Use get_crypto_raw_historical_data
+
+Always format your final response with proper UP/DOWN tags for percentage changes."""
             
             # System and user prompt
             messages_with_tools = [
-                SystemMessage("You are a helpful assistant that can pull current crypto data."),
+                SystemMessage(system_prompt),
                 HumanMessage(user_input),
             ]
             
@@ -94,7 +133,9 @@ async def ask_stream(user_input: str):
                     # Execute tool
                     tool_fn = {
                         "get_crypto_info": get_crypto_info, 
-                        "get_crypto_price": get_crypto_price
+                        "get_crypto_price": get_crypto_price,
+                        "get_crypto_historical_analysis": get_crypto_historical_analysis,
+                        "get_crypto_raw_historical_data": get_crypto_raw_historical_data
                     }[tool_call["name"]]
                     
                     tool_result = tool_fn.invoke(tool_call)
@@ -149,11 +190,31 @@ async def ask_simple(user_input: str):
             openai_api_version=api_version,
             api_key=azure_api_key,
         )
-        client_with_tools = client.bind_tools([get_crypto_info, get_crypto_price])
+        client_with_tools = client.bind_tools([
+            get_crypto_info, 
+            get_crypto_price,
+            get_crypto_historical_analysis,
+            get_crypto_raw_historical_data
+        ])
+        
+        # Enhanced system prompt for simple endpoint too
+        system_prompt = """You are a crypto analysis assistant with access to real-time and historical crypto data from Jesse.ai database.
+
+CRITICAL FORMATTING RULES:
+- For price increases: Use <UP>**X.XX%** (increase)</UP>
+- For price decreases: Use <DOWN>**X.XX%** (decrease)</DOWN>
+- NEVER use other formats like "UP +X%" or "DOWN -X%"
+- Always include "**" around the percentage and "(increase)" or "(decrease)" text
+
+CORRECT EXAMPLE:
+* 24 hours: <UP>**3.98%** (increase)</UP>
+* 7 days: <DOWN>**3.45%** (decrease)</DOWN>
+
+When the Jesse tool returns data with emojis (🟢, 🔴), convert those to proper UP/DOWN tags."""
         
         # System and user prompt
         messages_with_tools = [
-            SystemMessage("You are a helpful assistant that can pull current crypto data."),
+            SystemMessage(system_prompt),
             HumanMessage(user_input),
         ]
         
@@ -166,7 +227,9 @@ async def ask_simple(user_input: str):
             for tool_call in result.tool_calls:
                 tool_fn = {
                     "get_crypto_info": get_crypto_info, 
-                    "get_crypto_price": get_crypto_price
+                    "get_crypto_price": get_crypto_price,
+                    "get_crypto_historical_analysis": get_crypto_historical_analysis,
+                    "get_crypto_raw_historical_data": get_crypto_raw_historical_data
                 }[tool_call["name"]]
                 
                 tool_result = tool_fn.invoke(tool_call)
