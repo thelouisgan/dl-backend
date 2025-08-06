@@ -1,70 +1,257 @@
-#CRISPY2FISH
-
+#Crispy2qbit
+#!/usr/bin/env python3
 import os
 import json
 import asyncio
-import websockets
-from typing import Dict, Optional, List, Any
-from datetime import datetime, timedelta
 import logging
-from logging.handlers import RotatingFileHandler
-import traceback
+import ssl
+import socket
 import signal
-import sys
+from contextlib import closing, asynccontextmanager
+from datetime import datetime
+from typing import Optional, Dict, Any
 
+import websockets
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.exception_handlers import http_exception_handler
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import AzureChatOpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-# === Configure Logging ===
+# ===== Configuration =====
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        RotatingFileHandler(
-            'app.log',
-            maxBytes=5*1024*1024,  # 5MB
-            backupCount=3
-        ),
-        logging.StreamHandler()
+        logging.StreamHandler(),
+        logging.FileHandler('app.log', mode='a', encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
 
-# === Load Environment Variables ===
-try:
-    load_dotenv(dotenv_path=os.path.join("config", ".env"))
-    required_env_vars = ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY"]
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-    if missing_vars:
-        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
-except Exception as e:
-    logger.critical(f"Failed to load environment variables: {e}")
-    sys.exit(1)
+# Load environment variables
+load_dotenv()
 
-api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
-endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
-deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+# App configuration - removed required Azure vars for now
+config = {
+    "api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+    "deployment": os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
+    "ws_url": os.getenv("WS_URL", "wss://api.tgx.finance/v1/ws/"),  # Using Binance as test
+    "ping_interval": int(os.getenv("WS_PING_INTERVAL", "30")),
+    "default_port": int(os.getenv("PORT", "8001")),
+    "port_range": 100,
+    "ssl_enabled": os.getenv("SSL_ENABLED", "true").lower() == "true"
+}
 
-# === Setup FastAPI app ===
+# ===== Helper Functions =====
+def find_available_port(start_port: int, max_attempts: int) -> int:
+    """Find an available port in the given range"""
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('', port))
+                return port
+        except OSError:
+            continue
+    raise OSError(f"No available ports in range {start_port}-{start_port+max_attempts}")
+
+# ===== WebSocket Manager =====
+class WebSocketManager:
+    def __init__(self):
+        self.connection = None
+        self.connected = False
+        self._stop_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._message_queue = asyncio.Queue()
+        self._market_data = {}
+        self._reconnect_task = None
+
+    async def connect(self):
+        """Establish WebSocket connection with retry logic"""
+        if self.connected:
+            return
+
+        try:
+            logger.info(f"Connecting to Qubit WebSocket: {config['ws_url']}")
+            
+            # Create SSL context for TGX Finance
+            ssl_context = None
+            if config["ssl_enabled"]:
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+
+            self.connection = await websockets.connect(
+                config["ws_url"],
+                ping_interval=config["ping_interval"],
+                ping_timeout=10,
+                ssl=ssl_context
+            )
+            
+            self.connected = True
+            logger.info("Connected to Qubit successfully!")
+            
+            # Subscribe to market data immediately after connection
+            await self._subscribe_to_market_data()
+            
+            # Start listening task
+            asyncio.create_task(self._listen_messages())
+            
+        except Exception as e:
+            logger.error(f"Qubit WebSocket connection failed: {e}")
+            self.connected = False
+            # Schedule reconnection
+            if not self._reconnect_task or self._reconnect_task.done():
+                self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _subscribe_to_market_data(self):
+        """Subscribe to Qubit market data feeds"""
+        try:
+            # Subscribe to BTC market data (based on your screenshots)
+            subscription_messages = [
+                {
+                    "action": "sub",
+                    "data": {"contract_code": "BTCUSDT"},
+                    "topic": "market.ticker"
+                },
+                {
+                    "action": "sub", 
+                    "data": {"contract_code": "BTCUSDT"},
+                    "topic": "market.contract"
+                },
+                {
+                    "action": "sub",
+                    "data": {},
+                    "topic": "contracts.market"
+                }
+            ]
+            
+            for message in subscription_messages:
+                await self.connection.send(json.dumps(message))
+                logger.info(f"Subscribed to: {message['topic']}")
+                await asyncio.sleep(0.1)  # Small delay between subscriptions
+                
+        except Exception as e:
+            logger.error(f"Failed to subscribe to market data: {e}")
+
+    async def _reconnect_loop(self):
+        """Handle reconnection with exponential backoff"""
+        wait_time = 1
+        while not self._stop_event.is_set() and not self.connected:
+            await asyncio.sleep(wait_time)
+            try:
+                await self.connect()
+                wait_time = 1  # Reset on successful connection
+            except Exception as e:
+                logger.error(f"Reconnection failed: {e}")
+                wait_time = min(wait_time * 2, 30)  # Exponential backoff, max 30s
+
+    async def _listen_messages(self):
+        """Listen for incoming messages"""
+        try:
+            while not self._stop_event.is_set() and self.connected:
+                try:
+                    message = await asyncio.wait_for(self.connection.recv(), timeout=30.0)
+                    await self._process_message(message)
+                except asyncio.TimeoutError:
+                    # Send ping to keep connection alive
+                    if self.connection and not self.connection.closed:
+                        await self.connection.ping()
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("WebSocket connection closed")
+                    self.connected = False
+                    break
+                except Exception as e:
+                    logger.error(f"Error receiving message: {e}")
+                    break
+        finally:
+            self.connected = False
+            # Start reconnection
+            if not self._stop_event.is_set():
+                if not self._reconnect_task or self._reconnect_task.done():
+                    self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _process_message(self, message: str):
+        """Process received messages from Qubit"""
+        try:
+            data = json.loads(message)
+            
+            # Handle Qubit message format
+            if isinstance(data, dict):
+                # Store based on topic type
+                topic = data.get('topic', 'unknown')
+                action = data.get('action', 'unknown')
+                
+                if action == 'notify':
+                    # This is market data
+                    if 'data' in data:
+                        market_info = data['data']
+                        
+                        # Store by topic for easy access
+                        if topic not in self._market_data:
+                            self._market_data[topic] = {}
+                            
+                        self._market_data[topic].update(market_info)
+                        self._market_data['last_update'] = datetime.now().isoformat()
+                        
+                        logger.debug(f"Updated {topic}: {market_info}")
+                
+                # Always store the raw message too
+                self._market_data['latest_message'] = data
+                    
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Qubit message: {e}")
+        except Exception as e:
+            logger.error(f"Error processing Qubit message: {e}")
+
+    def get_market_data(self) -> Dict[str, Any]:
+        """Get current market data"""
+        return self._market_data.copy()
+
+    async def close(self):
+        """Clean shutdown"""
+        logger.info("Closing WebSocket connection...")
+        self._stop_event.set()
+        
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            
+        if self.connection and not self.connection.closed:
+            await self.connection.close()
+        
+        self.connected = False
+
+# ===== FastAPI App =====
+ws_manager = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage startup/shutdown"""
+    global ws_manager
+    
+    # Initialize WebSocket
+    ws_manager = WebSocketManager()
+    await ws_manager.connect()
+    app.state.ws_manager = ws_manager
+    
+    logger.info("Application startup complete")
+    
+    yield  # App runs here
+    
+    # Cleanup
+    logger.info("Shutting down application...")
+    if ws_manager:
+        await ws_manager.close()
+
 app = FastAPI(
     title="Crypto Assistant API",
-    description="Real-time cryptocurrency data assistant with Qubit integration",
+    description="Real-time cryptocurrency data assistant",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    lifespan=lifespan
 )
 
-# Security middleware
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,511 +259,111 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# === Qubit WebSocket Configuration ===
-QUBIT_WS_URL = "wss://api.tgx.finance/v1/ws/"
-ORIGIN_HEADER = "https://test.qb.finance"
-MAX_RECONNECT_ATTEMPTS = 10
-PING_INTERVAL = 15  # seconds
-RECONNECT_DELAY = 5  # seconds
-
-# Thread-safe data storage
-class MarketDataStore:
-    def __init__(self):
-        self._data: Dict[str, Dict] = {}
-        self._timestamps: Dict[str, datetime] = {}
-        self._lock = asyncio.Lock()
-    
-    async def update(self, contract_code: str, data: Dict):
-        async with self._lock:
-            self._data[contract_code] = data
-            self._timestamps[contract_code] = datetime.now()
-    
-    async def get(self, contract_code: str) -> Optional[Dict]:
-        async with self._lock:
-            return self._data.get(contract_code)
-    
-    async def get_timestamp(self, contract_code: str) -> Optional[datetime]:
-        async with self._lock:
-            return self._timestamps.get(contract_code)
-    
-    async def get_all_contracts(self) -> List[str]:
-        async with self._lock:
-            return list(self._data.keys())
-
-market_store = MarketDataStore()
-
-class QubitWebSocketClient:
-    def __init__(self):
-        self.websocket = None
-        self.is_connected = False
-        self._should_reconnect = True
-        self.reconnect_attempts = 0
-        self.active_subscriptions: List[Dict] = []
-        self._connection_lock = asyncio.Lock()
-        self._subscription_lock = asyncio.Lock()
-        self._ping_task = None
-        self._listen_task = None
-
-    async def _ensure_connection(self):
-        """Ensure we have an active connection"""
-        async with self._connection_lock:
-            if not self.is_connected or self.websocket is None or self.websocket.closed:
-                await self.connect()
-
-    @retry(
-        stop=stop_after_attempt(MAX_RECONNECT_ATTEMPTS),
-        wait=wait_exponential(multiplier=1, min=4, max=30),
-        retry=retry_if_exception_type(Exception),
-        reraise=True
-    )
-    async def connect(self):
-        """Establish WebSocket connection with auto-reconnect"""
-        try:
-            logger.info("Attempting to connect to Qubit WebSocket...")
-            self.websocket = await websockets.connect(
-                QUBIT_WS_URL,
-                ping_interval=PING_INTERVAL,
-                ping_timeout=PING_INTERVAL + 5,
-                close_timeout=0,
-                extra_headers={"Origin": ORIGIN_HEADER}
-            )
-            self.is_connected = True
-            self.reconnect_attempts = 0
-            logger.info("✅ Successfully connected to Qubit WebSocket")
-            
-            # Start background tasks
-            self._ping_task = asyncio.create_task(self._send_pings())
-            self._listen_task = asyncio.create_task(self._listen_for_messages())
-            
-            # Resubscribe to any active subscriptions
-            await self._resubscribe()
-            
-        except Exception as e:
-            self.is_connected = False
-            self.reconnect_attempts += 1
-            logger.error(f"❌ Connection attempt {self.reconnect_attempts} failed: {e}")
-            if self.reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
-                logger.critical("Max reconnection attempts reached. Giving up.")
-                raise
-            raise e
-
-    async def _resubscribe(self):
-        """Resubscribe to all active subscriptions"""
-        if not self.active_subscriptions:
-            return
-            
-        async with self._subscription_lock:
-            for sub in self.active_subscriptions:
-                try:
-                    await self.websocket.send(json.dumps(sub))
-                    logger.info(f"🔄 Resubscribed to {sub['topic']}")
-                except Exception as e:
-                    logger.error(f"Failed to resubscribe to {sub['topic']}: {e}")
-
-    async def subscribe(self, contract_code: str, topics: List[str]):
-        """Subscribe to specific market topics"""
-        await self._ensure_connection()
-        
-        async with self._subscription_lock:
-            for topic in topics:
-                subscription = {
-                    "action": "sub",
-                    "data": {"contract_code": contract_code},
-                    "topic": topic
-                }
-                try:
-                    await self.websocket.send(json.dumps(subscription))
-                    self.active_subscriptions.append(subscription)
-                    logger.info(f"🔔 Subscribed to {topic} for {contract_code}")
-                except Exception as e:
-                    logger.error(f"Failed to subscribe to {topic}: {e}")
-                    raise
-
-    async def _send_pings(self):
-        """Send regular pings to maintain connection"""
-        while self.is_connected and self._should_reconnect:
-            try:
-                await asyncio.sleep(PING_INTERVAL)
-                if self.websocket and not self.websocket.closed:
-                    await self.websocket.send("ping")
-                    logger.debug("Sent ping to server")
-            except Exception as e:
-                logger.error(f"⚠️ Ping failed: {e}")
-                self.is_connected = False
-                break
-
-    async def _listen_for_messages(self):
-        """Process incoming WebSocket messages"""
-        while self.is_connected and self._should_reconnect:
-            try:
-                message = await self.websocket.recv()
-                logger.debug(f"Received message: {message[:100]}...")  # Log first 100 chars
-                
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.warning(f"Received non-JSON message: {message}")
-                    continue
-                
-                if data.get("action") == "notify":
-                    topic = data.get("topic")
-                    contract_code = data.get("data", {}).get("contract_code")
-                    
-                    if not contract_code:
-                        logger.warning(f"No contract code in message: {data}")
-                        continue
-                        
-                    try:
-                        await market_store.update(contract_code, data.get("data", {}))
-                        if topic == "market.ticker":
-                            logger.debug(f"Updated ticker for {contract_code}")
-                    except Exception as e:
-                        logger.error(f"Failed to update market data: {e}")
-                        
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.error(f"WebSocket connection closed: {e}")
-                self.is_connected = False
-                await self._handle_disconnect()
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
-                self.is_connected = False
-                await self._handle_disconnect()
-
-    async def _handle_disconnect(self):
-        """Handle disconnection and attempt reconnect"""
-        if not self._should_reconnect:
-            return
-            
-        logger.info("Attempting to reconnect...")
-        try:
-            await self.connect()
-        except Exception as e:
-            logger.error(f"Reconnect failed: {e}")
-            # Schedule another reconnect attempt
-            asyncio.create_task(self._delayed_reconnect())
-
-    async def _delayed_reconnect(self):
-        """Wait before attempting to reconnect"""
-        await asyncio.sleep(RECONNECT_DELAY)
-        await self._handle_disconnect()
-
-    async def disconnect(self):
-        """Cleanly disconnect from WebSocket"""
-        self._should_reconnect = False
-        
-        if self._ping_task:
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except asyncio.CancelledError:
-                pass
-                
-        if self._listen_task:
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
-                pass
-                
-        if self.websocket and not self.websocket.closed:
-            await self.websocket.close()
-            logger.info("🔌 Disconnected from WebSocket")
-        
-        self.is_connected = False
-
-# Initialize WebSocket client
-qubit_client = QubitWebSocketClient()
-
-# === Signal Handlers ===
-async def shutdown_handler():
-    """Handle application shutdown"""
-    logger.info("Shutting down gracefully...")
-    await qubit_client.disconnect()
-
-def handle_signal(signum, frame):
-    """Handle OS signals"""
-    logger.info(f"Received signal {signum}, initiating shutdown...")
-    asyncio.create_task(shutdown_handler())
-
-# Register signal handlers
-signal.signal(signal.SIGINT, handle_signal)
-signal.signal(signal.SIGTERM, handle_signal)
-
-# === FastAPI Event Handlers ===
-@app.on_event("startup")
-async def startup_event():
-    """Initialize WebSocket connection and subscribe to BTC/USDT by default"""
-    logger.info("Starting up application...")
-    try:
-        await qubit_client.connect()
-        await qubit_client.subscribe("BTCUSDT", ["market.ticker", "contracts.market"])
-    except Exception as e:
-        logger.critical(f"Failed to initialize WebSocket: {e}")
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up WebSocket connection"""
-    await shutdown_handler()
-
-# === Utility Functions ===
-def normalize_symbol(symbol: str) -> str:
-    """Convert symbol formats (BTC/USDT -> BTCUSDT)"""
-    return symbol.upper().replace("/", "").replace("-", "")
-
-async def is_data_fresh(symbol: str, max_age: int = 30) -> bool:
-    """Check if market data is recent enough"""
-    normalized = normalize_symbol(symbol)
-    timestamp = await market_store.get_timestamp(normalized)
-    if not timestamp:
-        return False
-    return (datetime.now() - timestamp) < timedelta(seconds=max_age)
-
-# === Tool Functions ===
-@tool
-async def get_crypto_price(symbol: str) -> str:
-    """Get current cryptocurrency price from Qubit. Input should be a trading pair like 'BTC/USDT'."""
-    try:
-        normalized = normalize_symbol(symbol)
-        
-        if not await is_data_fresh(normalized):
-            return f"⚠️ Data for {symbol} is stale (>30 seconds old)"
-            
-        data = await market_store.get(normalized)
-        if not data:
-            available = await market_store.get_all_contracts()
-            return f"❌ No data for {symbol}. Available: {available}"
-            
-        price_fields = ["last_price", "price", "mark_price", "close"]
-        
-        for field in price_fields:
-            if field in data:
-                return f"💵 {symbol}: {data[field]} USDT"
-                
-        return f"⚠️ No price field found for {symbol}. Data: {json.dumps(data, indent=2)}"
-        
-    except Exception as e:
-        logger.error(f"Error in get_crypto_price: {e}\n{traceback.format_exc()}")
-        return f"❌ Error fetching price: {str(e)}"
-
-@tool
-async def get_crypto_info(symbol: str) -> str:
-    """Get detailed cryptocurrency market data. Input should be a trading pair like 'BTC/USDT'."""
-    try:
-        normalized = normalize_symbol(symbol)
-        
-        if not await is_data_fresh(normalized):
-            return f"⚠️ Data for {symbol} is stale (>30 seconds old)"
-            
-        data = await market_store.get(normalized)
-        if not data:
-            return f"❌ No data for {symbol}"
-            
-        info = [f"📊 {symbol.upper()} Market Data"]
-        
-        fields = {
-            "last_price": "Price",
-            "high_price": "24h High",
-            "low_price": "24h Low",
-            "volume": "Volume",
-            "change": "Change",
-            "change_ratio": "Change %",
-            "funding_rate": "Funding Rate",
-            "open_interest": "Open Interest"
-        }
-        
-        for field, label in fields.items():
-            if field in data:
-                value = f"{data[field]}%" if field.endswith("_ratio") or field == "change" else data[field]
-                info.append(f"{label}: {value}")
-                
-        timestamp = await market_store.get_timestamp(normalized)
-        if timestamp:
-            info.append(f"\n⏰ Updated: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-        return "\n".join(info)
-        
-    except Exception as e:
-        logger.error(f"Error in get_crypto_info: {e}\n{traceback.format_exc()}")
-        return f"❌ Error fetching info: {str(e)}"
-
-# === API Endpoints ===
-@app.get("/subscribe/{contract_code}")
-async def subscribe_to_contract(contract_code: str):
-    """Manually subscribe to a new contract"""
-    try:
-        if not qubit_client.is_connected:
-            raise HTTPException(status_code=503, detail="WebSocket not connected")
-            
-        await qubit_client.subscribe(contract_code, ["market.ticker", "contracts.market"])
-        return {"status": "subscribed", "contract": contract_code}
-    except Exception as e:
-        logger.error(f"Subscription failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+# ===== API Endpoints =====
 @app.get("/ask")
-async def ask_stream(user_input: str):
-    """Streaming endpoint for AI assistant"""
-    async def generate_response():
+async def ask_question(query: str):
+    """AI response endpoint with market data"""
+    
+    async def generate():
         try:
-            # Initialize AI client with retry
-            @retry(
-                stop=stop_after_attempt(3),
-                wait=wait_exponential(multiplier=1, min=4, max=10),
-                retry=retry_if_exception_type(Exception)
-            )
-            async def get_ai_client():
-                return AzureChatOpenAI(
-                    azure_endpoint=endpoint,
-                    azure_deployment=deployment,
-                    openai_api_version=api_version,
-                    api_key=azure_api_key,
-                    timeout=30,
-                    max_retries=3
-                )
-
-            client = await get_ai_client()
-            client_with_tools = client.bind_tools([get_crypto_info, get_crypto_price])
-
-            # Prepare conversation
-            messages = [
-                SystemMessage("You're a crypto assistant with real-time Qubit exchange data. Be concise but helpful."),
-                HumanMessage(user_input),
-            ]
-
-            # Get initial response
-            try:
-                result = await client.ainvoke(messages)
-                messages.append(result)
-            except Exception as e:
-                logger.error(f"AI invocation failed: {e}")
-                yield json.dumps({
-                    "type": "error",
-                    "content": "Sorry, I encountered an error processing your request."
-                }) + "\n"
-                return
-
-            # Handle tool calls
-            if hasattr(result, 'tool_calls') and result.tool_calls:
-                for tool_call in result.tool_calls:
-                    yield json.dumps({
-                        "type": "tool_call",
-                        "name": tool_call["name"],
-                        "args": tool_call["args"]
-                    }) + "\n"
-
-                    # Execute tool
-                    try:
-                        tool_fn = globals()[tool_call["name"]]
-                        tool_result = await tool_fn.ainvoke(tool_call["args"])
-                        messages.append(ToolMessage(
-                            content=tool_result,
-                            tool_call_id=tool_call["id"]
-                        ))
-
-                        yield json.dumps({
-                            "type": "tool_result",
-                            "content": tool_result
-                        }) + "\n"
-                    except Exception as e:
-                        logger.error(f"Tool execution failed: {e}")
-                        yield json.dumps({
-                            "type": "error",
-                            "content": f"Failed to execute {tool_call['name']}: {str(e)}"
-                        }) + "\n"
-
-            # Stream final response
-            try:
-                async for chunk in client_with_tools.astream(messages):
-                    if hasattr(chunk, 'content') and chunk.content:
-                        yield json.dumps({
-                            "type": "text",
-                            "content": chunk.content
-                        }) + "\n"
-            except Exception as e:
-                logger.error(f"Streaming failed: {e}")
-                yield json.dumps({
-                    "type": "error",
-                    "content": "Streaming response failed"
-                }) + "\n"
-
+            # Get current market data from Qubit
+            market_data = ws_manager.get_market_data() if ws_manager else {}
+            
+            # Extract useful info for AI response
+            btc_info = market_data.get('market.ticker', {})
+            contract_info = market_data.get('contracts.market', {})
+            
+            response_data = {
+                "query": query,
+                "btc_data": btc_info,
+                "contract_data": contract_info,
+                "response": f"Query: '{query}' | BTC Contract: {btc_info.get('contract_code', 'N/A')} | Last Update: {market_data.get('last_update', 'No data')}",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            yield json.dumps(response_data) + "\n"
+            
         except Exception as e:
-            logger.error(f"Error in ask_stream: {e}\n{traceback.format_exc()}")
-            yield json.dumps({
-                "type": "error",
-                "content": f"An unexpected error occurred: {str(e)}"
-            }) + "\n"
+            logger.error(f"Error generating response: {e}")
+            error_data = {"error": str(e), "timestamp": datetime.now().isoformat()}
+            yield json.dumps(error_data) + "\n"
 
-    return StreamingResponse(
-        generate_response(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # Disable buffering for nginx
-        }
-    )
+    return StreamingResponse(generate(), media_type="application/json")
 
-@app.get("/market_data")
+@app.get("/market-data")
 async def get_market_data():
-    """Debug endpoint for market data"""
-    try:
-        contracts = await market_store.get_all_contracts()
-        timestamps = {}
-        
-        for contract in contracts:
-            ts = await market_store.get_timestamp(contract)
-            if ts:
-                timestamps[contract] = ts.isoformat()
-        
-        return {
-            "connected": qubit_client.is_connected,
-            "subscriptions": qubit_client.active_subscriptions,
-            "available_contracts": contracts,
-            "last_updated": timestamps
-        }
-    except Exception as e:
-        logger.error(f"Error in market_data endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Get current market data"""
+    if not ws_manager:
+        raise HTTPException(status_code=503, detail="WebSocket manager not initialized")
+    
+    data = ws_manager.get_market_data()
+    return {
+        "connected": ws_manager.connected,
+        "data": data,
+        "timestamp": datetime.now().isoformat()
+    }
 
-# === Exception Handlers ===
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
-    logger.error(f"Unhandled exception: {exc}\n{traceback.format_exc()}")
-    return await http_exception_handler(request, exc)
-
-@app.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    """Custom HTTP exception handler"""
-    logger.error(f"HTTP error {exc.status_code}: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": exc.detail,
-            "status_code": exc.status_code
-        }
-    )
-
-# === Health Check ===
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "websocket_connected": qubit_client.is_connected,
+        "websocket_connected": ws_manager.connected if ws_manager else False,
+        "market_data_available": bool(ws_manager.get_market_data()) if ws_manager else False,
         "timestamp": datetime.now().isoformat()
     }
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Crypto Assistant API",
+        "endpoints": {
+            "/health": "Health check",
+            "/market-data": "Current market data",
+            "/ask?query=<question>": "Ask AI questions"
+        }
+    }
+
+# ===== Main Execution =====
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_config=None,
-        access_log=False,
-        timeout_keep_alive=60
-    )
+
+    try:
+        port = find_available_port(config["default_port"], config["port_range"])
+        logger.info(f"Starting server on port {port}")
+        
+        # Kill any existing process on the port
+        try:
+            import subprocess
+            import time
+            
+            # More aggressive port cleanup
+            result = subprocess.run(f"lsof -ti:{port}", shell=True, capture_output=True, text=True)
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid in pids:
+                    if pid:
+                        subprocess.run(f"kill -9 {pid}", shell=True, check=False)
+                        print(f"Killed process {pid} on port {port}")
+                time.sleep(1)  # Wait a moment
+        except Exception as e:
+            print(f"Port cleanup error: {e}")
+
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+            timeout_keep_alive=60,
+            reload=False  # Disable reload to prevent issues
+        )
+        
+    except OSError as e:
+        logger.error(f"Failed to start server: {e}")
+        print(f"Try running: lsof -ti:8000 | xargs kill -9")
+    except KeyboardInterrupt:
+        logger.info("Server shutdown complete")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
