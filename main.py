@@ -10,7 +10,11 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import AzureChatOpenAI
 
 # Import your Jesse tools
-from jesse_tools import get_crypto_historical_analysis, get_crypto_raw_historical_data
+from jesse_tools import (
+    get_crypto_historical_analysis, 
+    get_crypto_raw_historical_data,
+    get_crypto_historical_analysis_date_range
+)
 
 # === Load Environment Variables ===
 load_dotenv(dotenv_path=os.path.join("config", ".env"))
@@ -76,6 +80,7 @@ async def ask_stream(user_input: str):
                 get_crypto_info, 
                 get_crypto_price,
                 get_crypto_historical_analysis,
+                get_crypto_historical_analysis_date_range,
                 get_crypto_raw_historical_data
             ])
             
@@ -83,7 +88,8 @@ async def ask_stream(user_input: str):
             system_prompt = """You are a crypto analysis assistant with access to:
 1. Real-time crypto prices (get_crypto_price, get_crypto_info)
 2. Historical price analysis from Jesse.ai database (get_crypto_historical_analysis)
-3. Raw historical data (get_crypto_raw_historical_data)
+3. Date-specific historical analysis (get_crypto_historical_analysis_date_range)
+4. Raw historical data (get_crypto_raw_historical_data)
 
 CRITICAL FORMATTING RULES:
 - For price increases: Use <UP>**X.XX%** (increase)</UP>
@@ -104,7 +110,13 @@ INCORRECT EXAMPLES (DO NOT USE):
 When users ask about:
 - Current prices: Use get_crypto_price or get_crypto_info
 - Price history/trends/performance: Use get_crypto_historical_analysis (this provides data in emoji format, convert it to UP/DOWN tags)
+- Specific date ranges (e.g., "August 2024", "January 2023"): Use get_crypto_historical_analysis_date_range
 - Historical data for charts: Use get_crypto_raw_historical_data
+
+For date range requests:
+- Parse dates like "August 2024" as "2024-08-01" to "2024-08-31"
+- Parse "Q1 2024" as "2024-01-01" to "2024-03-31"
+- Parse "January 2023" as "2023-01-01" to "2023-01-31"
 
 Always format your final response with proper UP/DOWN tags for percentage changes."""
             
@@ -135,6 +147,7 @@ Always format your final response with proper UP/DOWN tags for percentage change
                         "get_crypto_info": get_crypto_info, 
                         "get_crypto_price": get_crypto_price,
                         "get_crypto_historical_analysis": get_crypto_historical_analysis,
+                        "get_crypto_historical_analysis_date_range": get_crypto_historical_analysis_date_range,
                         "get_crypto_raw_historical_data": get_crypto_raw_historical_data
                     }[tool_call["name"]]
                     
@@ -194,6 +207,7 @@ async def ask_simple(user_input: str):
             get_crypto_info, 
             get_crypto_price,
             get_crypto_historical_analysis,
+            get_crypto_historical_analysis_date_range,
             get_crypto_raw_historical_data
         ])
         
@@ -210,7 +224,9 @@ CORRECT EXAMPLE:
 * 24 hours: <UP>**3.98%** (increase)</UP>
 * 7 days: <DOWN>**3.45%** (decrease)</DOWN>
 
-When the Jesse tool returns data with emojis (🟢, 🔴), convert those to proper UP/DOWN tags."""
+When the Jesse tool returns data with <UP> or  <DOWN>, convert those to proper UP/DOWN tags.
+
+For specific date ranges, use get_crypto_historical_analysis_date_range with YYYY-MM-DD format."""
         
         # System and user prompt
         messages_with_tools = [
@@ -229,6 +245,7 @@ When the Jesse tool returns data with emojis (🟢, 🔴), convert those to prop
                     "get_crypto_info": get_crypto_info, 
                     "get_crypto_price": get_crypto_price,
                     "get_crypto_historical_analysis": get_crypto_historical_analysis,
+                    "get_crypto_historical_analysis_date_range": get_crypto_historical_analysis_date_range,
                     "get_crypto_raw_historical_data": get_crypto_raw_historical_data
                 }[tool_call["name"]]
                 

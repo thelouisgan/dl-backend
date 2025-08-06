@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -134,61 +134,91 @@ class JesseDatabase:
             return []
         
         try:
-            # Normalize symbol format
+            # Normalize symbol format - your debug shows BTC-USDT format
             jesse_symbol = symbol.replace('/', '-').upper()
             
-            # Calculate date range
-            end_date = datetime.now()
+            # Calculate date range with timezone awareness
+            end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=days_back)
             
+            logger.info(f"Querying for symbol: {jesse_symbol}, exchange: {exchange}, timeframe: {timeframe}")
+            logger.info(f"Date range: {start_date} to {end_date}")
+            
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Check if we have data for this symbol
+                # First check if we have data for this symbol
                 cursor.execute("""
-                    SELECT COUNT(*) as count FROM candle 
+                    SELECT COUNT(*) as count,
+                           MIN(to_timestamp(timestamp/1000)) as min_date,
+                           MAX(to_timestamp(timestamp/1000)) as max_date,
+                           STRING_AGG(DISTINCT timeframe, ', ') as available_timeframes
+                    FROM candle 
                     WHERE symbol = %s AND exchange = %s
                 """, (jesse_symbol, exchange))
                 
-                count_result = cursor.fetchone()
-                if not count_result['count']:
+                check_result = cursor.fetchone()
+                logger.info(f"Data check - Count: {check_result['count']}, Date range: {check_result['min_date']} to {check_result['max_date']}")
+                logger.info(f"Available timeframes: {check_result['available_timeframes']}")
+                
+                if not check_result['count']:
                     logger.warning(f"No data found for {jesse_symbol} on {exchange}")
                     return []
                 
-                # Query for daily aggregated data
+                # If the requested timeframe doesn't exist, use the first available one
+                if timeframe not in (check_result['available_timeframes'] or ''):
+                    cursor.execute("""
+                        SELECT DISTINCT timeframe FROM candle 
+                        WHERE symbol = %s AND exchange = %s
+                        ORDER BY timeframe
+                        LIMIT 1
+                    """, (jesse_symbol, exchange))
+                    
+                    timeframe_result = cursor.fetchone()
+                    if timeframe_result:
+                        actual_timeframe = timeframe_result['timeframe']
+                        logger.info(f"Using available timeframe: {actual_timeframe} instead of {timeframe}")
+                        timeframe = actual_timeframe
+                
+                # Get the most recent data if our date range is too old
+                # Adjust start_date if it's before our data starts
+                data_start = check_result['min_date']
+                data_end = check_result['max_date']
+                
+                # Ensure timezone consistency
+                if data_start and data_start.tzinfo is None:
+                    data_start = data_start.replace(tzinfo=timezone.utc)
+                if data_end and data_end.tzinfo is None:
+                    data_end = data_end.replace(tzinfo=timezone.utc)
+                
+                if start_date.tzinfo is None:
+                    start_date = start_date.replace(tzinfo=timezone.utc)
+                if end_date.tzinfo is None:
+                    end_date = end_date.replace(tzinfo=timezone.utc)
+                
+                if data_start and start_date < data_start:
+                    start_date = data_start
+                    logger.info(f"Adjusted start date to data availability: {start_date}")
+                
+                if data_end and end_date > data_end:
+                    end_date = data_end
+                    logger.info(f"Adjusted end date to data availability: {end_date}")
+                
+                # Query for aggregated daily data using a simpler approach
                 query = """
-                WITH daily_candles AS (
-                    SELECT 
-                        DATE(to_timestamp(timestamp/1000)) as trade_date,
-                        timestamp,
-                        open::float as open,
-                        high::float as high,
-                        low::float as low,
-                        close::float as close,
-                        volume::float as volume,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY DATE(to_timestamp(timestamp/1000)) 
-                            ORDER BY timestamp ASC
-                        ) as rn_asc,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY DATE(to_timestamp(timestamp/1000)) 
-                            ORDER BY timestamp DESC
-                        ) as rn_desc
-                    FROM candle 
-                    WHERE symbol = %s 
-                    AND exchange = %s
-                    AND timeframe = %s
-                    AND to_timestamp(timestamp/1000) >= %s
-                    AND to_timestamp(timestamp/1000) <= %s
-                )
                 SELECT 
-                    trade_date,
-                    MAX(CASE WHEN rn_asc = 1 THEN open END) as open,
-                    MAX(high) as high,
-                    MIN(low) as low,
-                    MAX(CASE WHEN rn_desc = 1 THEN close END) as close,
-                    SUM(volume) as volume
-                FROM daily_candles
-                GROUP BY trade_date
-                ORDER BY trade_date ASC
+                    DATE(to_timestamp(timestamp/1000)) as trade_date,
+                    timestamp,
+                    open::float as open,
+                    high::float as high,
+                    low::float as low,
+                    close::float as close,
+                    volume::float as volume
+                FROM candle 
+                WHERE symbol = %s 
+                AND exchange = %s
+                AND timeframe = %s
+                AND to_timestamp(timestamp/1000) >= %s
+                AND to_timestamp(timestamp/1000) <= %s
+                ORDER BY timestamp ASC
                 """
                 
                 cursor.execute(query, (
@@ -200,25 +230,64 @@ class JesseDatabase:
                 ))
                 
                 results = cursor.fetchall()
-                logger.info(f"Retrieved {len(results)} daily candles for {symbol}")
+                logger.info(f"Retrieved {len(results)} raw candles for {jesse_symbol}")
                 
-                # Convert to structured format
-                candles = []
+                if not results:
+                    # Try without timeframe filter as fallback
+                    logger.info("No results with timeframe filter, trying without...")
+                    cursor.execute("""
+                        SELECT 
+                            DATE(to_timestamp(timestamp/1000)) as trade_date,
+                            timestamp,
+                            open::float as open,
+                            high::float as high,
+                            low::float as low,
+                            close::float as close,
+                            volume::float as volume
+                        FROM candle 
+                        WHERE symbol = %s 
+                        AND exchange = %s
+                        AND to_timestamp(timestamp/1000) >= %s
+                        AND to_timestamp(timestamp/1000) <= %s
+                        ORDER BY timestamp ASC
+                        LIMIT 1000
+                    """, (jesse_symbol, exchange, start_date, end_date))
+                    
+                    results = cursor.fetchall()
+                    logger.info(f"Fallback query retrieved {len(results)} candles")
+                
+                # If we have minute data, aggregate to daily
+                daily_data = {}
                 for row in results:
-                    if row['open'] and row['close']:  # Ensure we have valid data
-                        candles.append({
-                            'date': row['trade_date'].strftime('%Y-%m-%d'),
-                            'open': float(row['open']),
-                            'high': float(row['high']),
-                            'low': float(row['low']),
-                            'close': float(row['close']),
-                            'volume': float(row['volume'] or 0)
-                        })
+                    date_str = row['trade_date'].strftime('%Y-%m-%d')
+                    
+                    if date_str not in daily_data:
+                        daily_data[date_str] = {
+                            'date': date_str,
+                            'open': row['open'],
+                            'high': row['high'],
+                            'low': row['low'],
+                            'close': row['close'],
+                            'volume': row['volume']
+                        }
+                    else:
+                        # Update high/low and close (keep first open)
+                        daily_data[date_str]['high'] = max(daily_data[date_str]['high'], row['high'])
+                        daily_data[date_str]['low'] = min(daily_data[date_str]['low'], row['low'])
+                        daily_data[date_str]['close'] = row['close']  # Last close of the day
+                        daily_data[date_str]['volume'] += row['volume']
                 
+                # Convert to list and sort by date
+                candles = list(daily_data.values())
+                candles.sort(key=lambda x: x['date'])
+                
+                logger.info(f"Aggregated to {len(candles)} daily candles")
                 return candles
                 
         except Exception as e:
             logger.error(f"Error fetching historical data for {symbol}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return []
         finally:
             conn.close()
@@ -393,8 +462,8 @@ def get_crypto_historical_analysis(symbol: str, exchange: str = "Binance Perpetu
                 direction = change_data['direction']
                 percentage = change_data['percentage']
                 
-                emoji = "🟢" if direction == "UP" else "🔴" if direction == "DOWN" else "⚪"
-                response += f"  {emoji} {period_label}: **{percentage:+.2f}%**\n"
+                tag = "<UP>" if direction == "UP" else "<DOWN>" if direction == "DOWN" else "⚪"
+                response += f"  {tag} {period_label}: **{percentage:+.2f}%**\n"
         
         # Technical indicators
         if 'technical_indicators' in analysis:
@@ -464,6 +533,119 @@ def get_available_crypto_symbols() -> str:
         
     except Exception as e:
         return f"❌ Error fetching available symbols: {str(e)}"
+
+@tool
+def get_crypto_historical_analysis_date_range(symbol: str, start_date: str, end_date: str, 
+                                            exchange: str = "Binance Perpetual Futures") -> str:
+    """
+    Get historical price analysis for a specific date range.
+    
+    Args:
+        symbol: The cryptocurrency symbol (e.g., 'BTC/USDT', 'ETH/USDT')
+        start_date: Start date in YYYY-MM-DD format (e.g., '2024-08-01')
+        end_date: End date in YYYY-MM-DD format (e.g., '2024-08-31')
+        exchange: The exchange name (default: 'Binance Perpetual Futures')
+    
+    Returns:
+        Formatted string with price changes and analysis for the specified period
+    """
+    try:
+        if not jesse_db.test_connection():
+            return "❌ Cannot connect to Jesse database."
+        
+        # Parse dates with timezone awareness
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(tzinfo=timezone.utc) + timedelta(days=1) - timedelta(seconds=1)
+        
+        # Calculate days for the range
+        days_diff = (end_dt - start_dt).days + 1
+        
+        # Get data using date range
+        conn = jesse_db.get_connection()
+        if not conn:
+            return "❌ Database connection failed"
+        
+        jesse_symbol = symbol.replace('/', '-').upper()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            query = """
+            SELECT 
+                DATE(to_timestamp(timestamp/1000)) as trade_date,
+                timestamp,
+                open::float as open,
+                high::float as high,
+                low::float as low,
+                close::float as close,
+                volume::float as volume
+            FROM candle 
+            WHERE symbol = %s 
+            AND exchange = %s
+            AND to_timestamp(timestamp/1000) >= %s
+            AND to_timestamp(timestamp/1000) <= %s
+            ORDER BY timestamp ASC
+            """
+            
+            cursor.execute(query, (jesse_symbol, exchange, start_dt, end_dt))
+            results = cursor.fetchall()
+            
+            if not results:
+                return f"❌ No data found for {symbol} between {start_date} and {end_date}"
+            
+            # Aggregate to daily data
+            daily_data = {}
+            for row in results:
+                date_str = row['trade_date'].strftime('%Y-%m-%d')
+                
+                if date_str not in daily_data:
+                    daily_data[date_str] = {
+                        'date': date_str,
+                        'open': row['open'],
+                        'high': row['high'],
+                        'low': row['low'],
+                        'close': row['close'],
+                        'volume': row['volume']
+                    }
+                else:
+                    daily_data[date_str]['high'] = max(daily_data[date_str]['high'], row['high'])
+                    daily_data[date_str]['low'] = min(daily_data[date_str]['low'], row['low'])
+                    daily_data[date_str]['close'] = row['close']
+                    daily_data[date_str]['volume'] += row['volume']
+            
+            candles = sorted(daily_data.values(), key=lambda x: x['date'])
+            
+            if not candles:
+                return f"❌ No aggregated data for the requested period"
+            
+            # Calculate period performance
+            start_price = candles[0]['open']
+            end_price = candles[-1]['close']
+            total_change = ((end_price - start_price) / start_price) * 100
+            
+            # Find highest and lowest prices in the period
+            highest = max(candles, key=lambda x: x['high'])
+            lowest = min(candles, key=lambda x: x['low'])
+            
+            response = f"📊 **{symbol} Analysis: {start_date} to {end_date}**\n\n"
+            response += f"💰 Period Performance:\n"
+            response += f"  📈 Start Price: ${start_price:,.4f} ({candles[0]['date']})\n"
+            response += f"  📈 End Price: ${end_price:,.4f} ({candles[-1]['date']})\n"
+            response += f"  📊 Total Change: **{total_change:+.2f}%**\n\n"
+            
+            response += f"🎯 Period Extremes:\n"
+            response += f"  🔺 Highest: ${highest['high']:,.4f} ({highest['date']})\n"
+            response += f"  🔻 Lowest: ${lowest['low']:,.4f} ({lowest['date']})\n\n"
+            
+            response += f"📋 Data Summary:\n"
+            response += f"  📅 Trading Days: {len(candles)}\n"
+            response += f"  📊 Total Volume: {sum(c['volume'] for c in candles):,.0f}\n"
+            
+            return response
+        
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Error in date range analysis: {e}")
+        return f"❌ Error analyzing {symbol} for {start_date} to {end_date}: {str(e)}"
 
 @tool
 def get_crypto_raw_historical_data(symbol: str, days: int = 30, 
