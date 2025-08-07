@@ -1,6 +1,9 @@
-#crispy2cookies675
+#Crispy2FINAL
 
 #!/usr/bin/env python3
+
+import time
+from typing import List, Dict, Any, Optional
 import os
 import json
 import asyncio
@@ -8,9 +11,12 @@ import logging
 import ssl
 import socket
 import signal
+import aiohttp
 from contextlib import closing, asynccontextmanager
 from datetime import datetime
-from typing import Optional, Dict, Any
+import hashlib
+import hmac
+import asyncio
 
 import websockets
 from fastapi import FastAPI, HTTPException, Request
@@ -40,24 +46,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
-# App configuration - TGX Finance
 config = {
     "ws_url": os.getenv("WS_URL", "wss://api.tgx.finance/v1/ws/"),
+    "app_id": int(os.getenv("APP_ID", "1")),
+    "token": os.getenv("TOKEN", ""),  # Optional - only needed for user-specific data
+    "secret": os.getenv("SECRET", ""),  # Optional - for authentication
     "ping_interval": int(os.getenv("WS_PING_INTERVAL", "30")),
     "ping_timeout": int(os.getenv("WS_PING_TIMEOUT", "10")),
     "close_timeout": int(os.getenv("WS_CLOSE_TIMEOUT", "10")),
-    "heartbeat_interval": int(os.getenv("HEARTBEAT_INTERVAL", "25")),
-    "default_port": int(os.getenv("PORT", "8000")),  # Changed to 8000 to match frontend
+    "heartbeat_interval": int(os.getenv("HEARTBEAT_INTERVAL", "50")),  # 50s as per docs
+    "default_port": int(os.getenv("PORT", "8000")),
     "port_range": 100,
     "ssl_enabled": os.getenv("SSL_ENABLED", "true").lower() == "true",
     "max_reconnect_attempts": 5,
     "reconnect_delay": 2.0
 }
 
-# ===== Helper Functions =====
 def find_available_port(start_port: int, max_attempts: int) -> int:
     """Find an available port in the given range"""
     for port in range(start_port, start_port + max_attempts):
@@ -78,7 +84,24 @@ def format_price(price_str: str) -> str:
     except (ValueError, TypeError):
         return str(price_str)
 
-# ===== WebSocket Manager =====
+def create_signature(data: Dict[str, Any], secret: str) -> str:
+    """Create signature for TGX authentication (if needed)"""
+    if not secret:
+        return ""
+    
+    # Sort parameters and create query string
+    sorted_params = sorted(data.items())
+    query_string = "&".join([f"{k}={v}" for k, v in sorted_params if k != "sign"])
+    
+    # Create HMAC SHA256 signature
+    signature = hmac.new(
+        secret.encode('utf-8'), 
+        query_string.encode('utf-8'), 
+        hashlib.sha256
+    ).hexdigest()
+    
+    return signature
+
 class TGXWebSocketManager:
     def __init__(self):
         self.connection = None
@@ -92,20 +115,21 @@ class TGXWebSocketManager:
             "connection_status": "disconnected",
             "last_update": None,
             "message_count": 0,
-            "latest_raw_message": {}
+            "latest_raw_message": {},
+            "subscriptions": []
         }
         self._reconnect_task = None
         self._heartbeat_task = None
+        self._authenticated = False
 
     async def connect(self):
+        """Connect to TGX Finance WebSocket"""
         if self.connected and self.connection is not None:
-            # Check if connection is still alive
             try:
                 if hasattr(self.connection, 'closed') and not self.connection.closed:
                     logger.info("Already connected to TGX Finance!")
                     return
             except AttributeError:
-                # Handle the 'ClientConnection' object has no attribute 'closed' error
                 logger.warning("Connection object doesn't have 'closed' attribute, reconnecting...")
                 self.connected = False
                 self.connection = None
@@ -117,14 +141,12 @@ class TGXWebSocketManager:
             try:
                 logger.info(f"Connecting to TGX Finance WebSocket: {config['ws_url']} (attempt {retry_count + 1})")
                 
-                # Create SSL context
                 ssl_context = None
                 if config["ssl_enabled"]:
                     ssl_context = ssl.create_default_context()
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
 
-                # Connect with proper timeout settings
                 self.connection = await websockets.connect(
                     config["ws_url"],
                     ping_interval=config["ping_interval"],
@@ -137,14 +159,18 @@ class TGXWebSocketManager:
                 self._market_data["connection_status"] = "connected"
                 logger.info("✅ Connected to TGX Finance successfully!")
 
-                # Subscribe to feeds
-                await self._subscribe_to_all_feeds()
+                # Authenticate if credentials are provided
+                if config.get("token") and config.get("secret"):
+                    await self._authenticate()
+                
+                # Subscribe to market feeds
+                await self._subscribe_to_feeds()
                 
                 # Start heartbeat task
                 if self._heartbeat_task is None or self._heartbeat_task.done():
                     self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                 
-                # Listen for messages
+                # Start listening for messages
                 await self._listen_messages()
                 break
                 
@@ -157,79 +183,132 @@ class TGXWebSocketManager:
                 if retry_count < max_retries:
                     await asyncio.sleep(config["reconnect_delay"])
 
+    async def _authenticate(self):
+        """Authenticate with TGX Finance (optional)"""
+        try:
+            ts = int(time.time())
+            auth_data = {
+                "app_id": config["app_id"],
+                "token": config["token"],
+                "ts": ts
+            }
+            
+            # Create signature if secret is provided
+            if config.get("secret"):
+                auth_data["sign"] = create_signature(auth_data, config["secret"])
+            
+            auth_message = {
+                "action": "auth",
+                "topic": "auth",
+                "data": auth_data
+            }
+            
+            await self.connection.send(json.dumps(auth_message))
+            logger.info("🔐 Sent authentication request")
+            
+        except Exception as e:
+            logger.warning(f"Authentication failed: {e}")
+
     async def _heartbeat_loop(self):
-        """Send periodic heartbeats to keep connection alive"""
+        """Send periodic heartbeats using TGX protocol"""
         try:
             while self.connected and not self._stop_event.is_set():
                 await asyncio.sleep(config["heartbeat_interval"])
                 if self.connection and self.connected:
                     try:
-                        # Check if connection has closed attribute and use it safely
-                        if hasattr(self.connection, 'closed'):
-                            if not self.connection.closed:
-                                await self.connection.ping()
-                                logger.debug("💗 Heartbeat sent")
-                            else:
-                                logger.warning("Connection is closed, stopping heartbeat")
-                                break
-                        else:
-                            # If no closed attribute, just try to ping
-                            await self.connection.ping()
-                            logger.debug("💗 Heartbeat sent")
+                        ts = int(time.time())
+                        heartbeat_data = {
+                            "app_id": config["app_id"],
+                            "ts": ts
+                        }
+                        
+                        # Add token and signature if available
+                        if config.get("token"):
+                            heartbeat_data["token"] = config["token"]
+                            if config.get("secret"):
+                                heartbeat_data["sign"] = create_signature(heartbeat_data, config["secret"])
+                        
+                        heartbeat_msg = {
+                            "action": "heart",
+                            "topic": "heart",
+                            "data": heartbeat_data
+                        }
+                        
+                        await self.connection.send(json.dumps(heartbeat_msg))
+                        logger.debug("💓 Sent TGX heartbeat")
+                        
                     except Exception as e:
-                        logger.warning(f"Heartbeat ping failed: {e}")
+                        logger.warning(f"Heartbeat failed: {e}")
                         break
+  
         except Exception as e:
             logger.error(f"Heartbeat loop error: {e}")
         finally:
             await self._cleanup_connection()
 
-    async def _subscribe_to_all_feeds(self):
-        """Subscribe to all TGX Finance data feeds"""
+    async def _subscribe_to_feeds(self):
+        """Subscribe to TGX Finance data feeds using correct protocol"""
+        if not self.connection or not self.connected:
+            logger.warning("Cannot subscribe - not connected")
+            return
+    
         try:
-            logger.info("Starting subscription process...")
-            subscriptions = [
-                {
-                    "action": "sub",
-                    "topic": "market.ticker",
-                    "params": {"contract_code": "BTCUSDT"}
-                },
-                {
-                    "action": "sub",
-                    "topic": "market.contract",
-                    "params": {"contract_code": "BTCUSDT"}
-                },
-                {
-                    "action": "sub",
-                    "topic": "market.depth",
-                    "params": {"contract_code": "BTCUSDT"}
+            logger.info("📡 Subscribing to TGX Finance feeds...")
+            
+            # 1. Subscribe to BTC contract switching (gets ticker, depth, contract info)
+            btc_switch_sub = {
+                "action": "sub",
+                "topic": "market.contract.switch",
+                "data": {
+                    "contract_code": "BTCUSDT"
                 }
+            }
+            await self.connection.send(json.dumps(btc_switch_sub))
+            logger.info(f"📊 Subscribed to BTC contract feed")
+            await asyncio.sleep(0.5)
+            
+            # 2. Subscribe to all contracts market data
+            all_contracts_sub = {
+                "action": "sub",
+                "topic": "contracts.market",
+                "data": {}
+            }
+            await self.connection.send(json.dumps(all_contracts_sub))
+            logger.info(f"📈 Subscribed to all contracts market feed")
+            await asyncio.sleep(0.5)
+            
+            # 3. Set depth precision (optional)
+            depth_precision_sub = {
+                "action": "sub",
+                "topic": "market.depth.switch",
+                "data": {
+                    "level": 2  # 0-4, where 0 is original precision
+                }
+            }
+            await self.connection.send(json.dumps(depth_precision_sub))
+            logger.info(f"📊 Set depth precision to level 2")
+            await asyncio.sleep(0.5)
+            
+            self._market_data["subscriptions"] = [
+                "market.contract.switch:BTCUSDT",
+                "contracts.market",
+                "market.depth.switch:level2"
             ]
-
-            for sub in subscriptions:
-                if self.connection and self.connected:
-                    try:
-                        await self.connection.send(json.dumps(sub))
-                        logger.info(f"Subscribed to: {sub['topic']}")
-                        await asyncio.sleep(0.2)
-                    except Exception as e:
-                        logger.error(f"Failed to subscribe to {sub['topic']}: {e}")
-                        
+            
         except Exception as e:
             logger.error(f"Subscription error: {e}")
 
     async def _listen_messages(self):
-        """Listen for incoming messages with robust error handling"""
+        """Listen for incoming messages with TGX protocol handling"""
         consecutive_errors = 0
         max_consecutive_errors = 5
         
         try:
             while not self._stop_event.is_set() and self.connected:
                 try:
-                    # Use asyncio.wait_for to add timeout
                     message = await asyncio.wait_for(
                         self.connection.recv(), 
-                        timeout=60.0
+                        timeout=120.0  # Longer timeout for TGX
                     )
                     
                     consecutive_errors = 0
@@ -239,7 +318,6 @@ class TGXWebSocketManager:
                     logger.debug("Message receive timeout - checking connection")
                     if self.connection:
                         try:
-                            # Check if connection is still alive
                             if hasattr(self.connection, 'closed') and self.connection.closed:
                                 logger.warning("Connection closed during timeout")
                                 break
@@ -273,50 +351,158 @@ class TGXWebSocketManager:
                 asyncio.create_task(self._reconnect_with_delay())
 
     async def _process_tgx_message(self, message: str):
-        """Process TGX Finance messages and update market data"""
+        """Process TGX Finance messages according to protocol specification"""
         try:
+            logger.info(f"📨 Raw TGX message: {message[:300]}...")
+            
             data = json.loads(message)
             self._market_data["message_count"] += 1
             self._market_data["last_update"] = datetime.now().isoformat()
-            
-            # Skip if not a dictionary
-            if not isinstance(data, dict):
-                logger.debug(f"Received non-dict message: {str(data)[:100]}...")
-                return
-            
-            topic = data.get('topic', 'unknown')
-            action = data.get('action', 'unknown')
-            msg_data = data.get('data', {})
-            
-            # Store raw message for debugging
             self._market_data["latest_raw_message"] = data
+
+            # Handle different TGX message types based on action and topic
+            action = data.get("action")
+            topic = data.get("topic")
+            msg_data = data.get("data", {})
             
-            # Handle different message types
-            if action == "notify":
-                if topic == "market.ticker":
-                    if isinstance(msg_data, dict):
-                        self._market_data["btc_ticker"] = msg_data
-                        if "price" in msg_data:
-                            self._market_data["price_history"].append({
-                                "price": msg_data["price"],
-                                "timestamp": datetime.now().isoformat()
-                            })
-                            # Keep only last 100 prices
-                            if len(self._market_data["price_history"]) > 100:
-                                self._market_data["price_history"] = self._market_data["price_history"][-100:]
+            if action == "auth" and topic == "auth":
+                # Authentication response
+                code = data.get("code", -1)
+                if code == 0:
+                    self._authenticated = True
+                    logger.info("🔐 Authentication successful")
+                else:
+                    logger.warning(f"❌ Authentication failed with code: {code}")
+                    
+            elif action == "sub":
+                # Subscription confirmation
+                code = data.get("code", -1)
+                if code == 0:
+                    logger.info(f"✅ Subscription confirmed for topic: {topic}")
+                else:
+                    err_msg = data.get("err_msg", "Unknown error")
+                    logger.warning(f"❌ Subscription failed for {topic}: {err_msg}")
+                    
+            elif action == "notify":
+                # Data push notifications
+                await self._handle_notification(topic, msg_data, data.get("ts"))
                 
-                elif topic == "market.contract" and isinstance(msg_data, dict):
-                    self._market_data["contract_info"] = msg_data
-                
-                elif topic == "market.depth" and isinstance(msg_data, dict):
-                    self._market_data["market_depth"] = msg_data
-                
-                logger.debug(f"Processed {topic} message")
+            else:
+                logger.info(f"🔍 Unhandled message type: action={action}, topic={topic}")
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON: {e}\nMessage: {message[:200]}...")
         except Exception as e:
-            logger.error(f"Processing error: {e}")
+            logger.error(f"Message processing error: {e}")
+
+    async def _handle_notification(self, topic: str, data: Dict[str, Any], timestamp: Optional[int]):
+        """Handle different types of notification messages"""
+        try:
+            if topic == "market.ticker":
+                # Latest trades notification
+                contract_code = data.get("contract_code", "")
+                trade_list = data.get("list", [])
+                
+                if trade_list:
+                    latest_trade = trade_list[0]
+                    price = latest_trade.get("trade_price", latest_trade.get("price", ""))
+                    
+                    # Update ticker data
+                    self._market_data["btc_ticker"].update({
+                        "contract_code": contract_code,
+                        "price": price,
+                        "last_trade": latest_trade,
+                        "timestamp": timestamp or int(time.time())
+                    })
+                    
+                    # Add to price history
+                    if price:
+                        self._market_data["price_history"].append({
+                            "price": price,
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        if len(self._market_data["price_history"]) > 100:
+                            self._market_data["price_history"] = self._market_data["price_history"][-100:]
+                    
+                    logger.info(f"📈 TRADE UPDATE: {contract_code} @ {price}")
+                    
+            elif topic == "market.price.index":
+                # Contract index price push
+                contract_code = data.get("contract_code", "")
+                price = data.get("price", "")
+                spot_price = data.get("spot_index_price", "")
+                
+                self._market_data["btc_ticker"].update({
+                    "contract_code": contract_code,
+                    "index_price": price,
+                    "spot_index_price": spot_price,
+                    "timestamp": data.get("ts", timestamp)
+                })
+                
+                logger.info(f"📊 INDEX UPDATE: {contract_code} Index: {price}, Spot: {spot_price}")
+                
+            elif topic == "contracts.market":
+                # All contracts market data
+                if isinstance(data, list):
+                    for contract in data:
+                        contract_code = contract.get("contract_code", "")
+                        if "BTC" in contract_code.upper():
+                            self._market_data["btc_ticker"].update({
+                                "contract_code": contract_code,
+                                "price": contract.get("price", ""),
+                                "index_price": contract.get("index_price", ""),
+                                "change_ratio": contract.get("change_ratio", ""),
+                                "change": contract.get("change", ""),
+                                "buy_count": contract.get("buy_count", 0),
+                                "sell_count": contract.get("sell_count", 0)
+                            })
+                            
+                            logger.info(f"💰 MARKET UPDATE: {contract_code} @ {contract.get('price', 'N/A')} ({contract.get('change_ratio', 'N/A')}%)")
+                            break
+                            
+            elif topic == "contract.applies":
+                # Contract change ratio update
+                contract_code = data.get("contract_code", "")
+                change_ratio = data.get("change_ratio", "")
+                change = data.get("change", "")
+                high_price = data.get("high_price", "")
+                low_price = data.get("low_price", "")
+                trade_24h = data.get("trade_24h", "")
+                
+                if "BTC" in contract_code.upper():
+                    self._market_data["btc_ticker"].update({
+                        "contract_code": contract_code,
+                        "change_ratio": change_ratio,
+                        "change": change,
+                        "high_24h": high_price,
+                        "low_24h": low_price,
+                        "volume_24h": trade_24h
+                    })
+                    
+                    logger.info(f"📊 STATS UPDATE: {contract_code} Change: {change_ratio}%, High: {high_price}, Low: {low_price}")
+                    
+            elif topic == "market.depth":
+                # Market depth data
+                contract_code = data.get("contract_code", "")
+                level = data.get("level", 0)
+                buy_orders = data.get("buy", [])
+                sell_orders = data.get("sell", [])
+                
+                self._market_data["market_depth"] = {
+                    "contract_code": contract_code,
+                    "level": level,
+                    "bids": buy_orders,
+                    "asks": sell_orders,
+                    "timestamp": timestamp or int(time.time())
+                }
+                
+                logger.info(f"📊 DEPTH UPDATE: {contract_code} Level {level} - {len(buy_orders)} bids, {len(sell_orders)} asks")
+                
+            else:
+                logger.info(f"🔍 Unhandled notification topic: {topic}")
+                
+        except Exception as e:
+            logger.error(f"Notification handling error for topic {topic}: {e}")
 
     async def _reconnect_with_delay(self):
         """Reconnect after a delay"""
@@ -339,17 +525,25 @@ class TGXWebSocketManager:
     def get_market_summary(self) -> Dict[str, Any]:
         """Get a formatted market summary"""
         ticker = self._market_data.get("btc_ticker", {})
+        depth = self._market_data.get("market_depth", {})
         
         summary = {
             "symbol": ticker.get("contract_code", "BTCUSDT"),
             "price": ticker.get("price", "N/A"),
-            "change_24h": ticker.get("change_percent", "N/A"),
-            "volume": ticker.get("volume", "N/A"),
-            "high_24h": ticker.get("high", "N/A"),
-            "low_24h": ticker.get("low", "N/A"),
+            "index_price": ticker.get("index_price", "N/A"),
+            "change_24h": ticker.get("change_ratio", "N/A"),
+            "change_abs": ticker.get("change", "N/A"),
+            "volume": ticker.get("volume_24h", "N/A"),
+            "high_24h": ticker.get("high_24h", "N/A"),
+            "low_24h": ticker.get("low_24h", "N/A"),
+            "buy_count": ticker.get("buy_count", 0),
+            "sell_count": ticker.get("sell_count", 0),
             "connection_status": self._market_data["connection_status"],
             "last_update": self._market_data["last_update"],
-            "message_count": self._market_data["message_count"]
+            "message_count": self._market_data["message_count"],
+            "authenticated": self._authenticated,
+            "subscriptions": len(self._market_data["subscriptions"]),
+            "depth_available": bool(depth)
         }
         
         return summary
@@ -376,44 +570,154 @@ class TGXWebSocketManager:
 class CryptoAI:
     def __init__(self, ws_manager: TGXWebSocketManager):
         self.ws_manager = ws_manager
+        self._fallback_data = {}
+        self._last_fallback_fetch = None
+        
+    async def _fetch_fallback_data(self):
+        """Fetch data from a public API as fallback"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get('https://api.coindesk.com/v1/bpi/currentprice.json', timeout=5) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        btc_price = data['bpi']['USD']['rate'].replace(',', '')
+                        self._fallback_data = {
+                            "price": float(btc_price),
+                            "source": "CoinDesk API",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        self._last_fallback_fetch = datetime.now()
+                        logger.info(f"📡 Fallback data fetched: BTC ${btc_price}")
+                        return True
+        except Exception as e:
+            logger.warning(f"Fallback API fetch failed: {e}")
+        
+        return False
         
     def generate_response(self, query: str) -> str:
         """Generate AI-like responses based on query and market data"""
         query_lower = query.lower()
         market_data = self.ws_manager.get_market_summary()
         
+        connection_status = market_data.get("connection_status", "unknown")
+        message_count = market_data.get("message_count", 0)
+        authenticated = market_data.get("authenticated", False)
+        
+        # Check if we should use fallback data
+        use_fallback = (market_data.get("price", "N/A") == "N/A" and 
+                       self._fallback_data.get("price") is not None)
+        
         if any(word in query_lower for word in ["price", "cost", "value", "btc", "bitcoin"]):
             price = market_data.get("price", "N/A")
+            index_price = market_data.get("index_price", "N/A")
             change = market_data.get("change_24h", "N/A")
-            return f"💰 Bitcoin (BTC) is currently trading at {format_price(str(price))}. The 24h change is {change}%. Market data is live from TGX Finance."
+            
+            if price != "N/A":
+                response = f"💰 Bitcoin (BTC) is currently trading at {format_price(str(price))}"
+                if index_price != "N/A":
+                    response += f" (Index: {format_price(str(index_price))})"
+                if change != "N/A":
+                    response += f". The 24h change is {change}%"
+                response += ". Data is live from TGX Finance!"
+                return response
+            elif use_fallback:
+                fallback_price = self._fallback_data["price"]
+                source = self._fallback_data["source"]
+                return f"💰 Bitcoin (BTC) is currently trading at {format_price(str(fallback_price))} (via {source} - TGX Finance: {connection_status}). TGX live data coming soon!"
+            else:
+                return f"💰 Bitcoin price data is currently unavailable. Connection: {connection_status} | Messages: {message_count} | Auth: {'✅' if authenticated else '❌'}"
         
-        elif any(word in query_lower for word in ["volume", "trading", "activity"]):
+        elif any(word in query_lower for word in ["volume", "trading", "activity", "buy", "sell"]):
             volume = market_data.get("volume", "N/A")
-            return f"📊 Current BTC trading volume is {volume}. This indicates market activity from TGX Finance data."
+            buy_count = market_data.get("buy_count", 0)
+            sell_count = market_data.get("sell_count", 0)
+            
+            response = f"📊 Trading Data:"
+            if volume != "N/A":
+                response += f"\n• 24h Volume: {volume}"
+            if buy_count or sell_count:
+                response += f"\n• Bullish traders: {buy_count}"
+                response += f"\n• Bearish traders: {sell_count}"
+                sentiment = "Bullish" if buy_count > sell_count else "Bearish" if sell_count > buy_count else "Neutral"
+                response += f"\n• Market sentiment: {sentiment}"
+            
+            if volume == "N/A" and not buy_count and not sell_count:
+                response = f"📊 Trading volume data is currently unavailable. Connection: {connection_status}"
+            
+            return response
         
         elif any(word in query_lower for word in ["high", "low", "range", "24h"]):
             high = market_data.get("high_24h", "N/A")
             low = market_data.get("low_24h", "N/A")
-            return f"📈 Today's BTC range: High {format_price(str(high))} | Low {format_price(str(low))}. Trading range from TGX Finance."
+            change = market_data.get("change_abs", "N/A")
+            
+            if high != "N/A" or low != "N/A":
+                response = f"📈 24h BTC Range:"
+                if high != "N/A":
+                    response += f"\n• High: {format_price(str(high))}"
+                if low != "N/A":
+                    response += f"\n• Low: {format_price(str(low))}"
+                if change != "N/A":
+                    response += f"\n• Net Change: {change}"
+                return response
+            else:
+                return f"📈 Price range data is currently unavailable. Status: {connection_status}"
         
-        elif any(word in query_lower for word in ["status", "connection", "working", "online"]):
-            status = market_data.get("connection_status", "unknown")
-            msg_count = market_data.get("message_count", 0)
-            return f"🟢 TGX Finance connection is {status}. Received {msg_count} market updates so far. All systems operational!"
+        elif any(word in query_lower for word in ["depth", "book", "orders", "bid", "ask"]):
+            full_data = self.ws_manager.get_full_market_data()
+            depth = full_data.get("market_depth", {})
+            
+            if depth:
+                bids = depth.get("bids", [])
+                asks = depth.get("asks", [])
+                level = depth.get("level", 0)
+                
+                response = f"📊 Market Depth (Level {level}):"
+                if asks:
+                    response += f"\n• Best Ask: {asks[0].get('price', 'N/A')} ({asks[0].get('amount', 'N/A')} units)"
+                if bids:
+                    response += f"\n• Best Bid: {bids[0].get('price', 'N/A')} ({bids[0].get('amount', 'N/A')} units)"
+                response += f"\n• Total bids: {len(bids)}, Total asks: {len(asks)}"
+                return response
+            else:
+                return f"📊 Market depth data is currently unavailable. Connection: {connection_status}"
         
-        elif any(word in query_lower for word in ["crypto", "market", "analysis", "trend"]):
-            price = market_data.get("price", "N/A")
-            change = market_data.get("change_24h", "N/A")
-            return f"🔍 Current market analysis: BTC at {format_price(str(price))} with {change}% 24h change. Live TGX Finance data analysis."
+        elif any(word in query_lower for word in ["status", "connection", "working", "online", "debug"]):
+            full_data = self.ws_manager.get_full_market_data()
+            subscriptions = full_data.get("subscriptions", [])
+            
+            return f"""🔍 **TGX Finance System Status:**
+• Connection: {connection_status}
+• Authentication: {'✅ Authenticated' if authenticated else '❌ Not authenticated'}
+• Messages received: {message_count}
+• Active subscriptions: {len(subscriptions)}
+• Last update: {market_data.get('last_update', 'Never')}
+• Depth data available: {'✅' if market_data.get('depth_available') else '❌'}
+
+Subscribed feeds: {', '.join(subscriptions) if subscriptions else 'None'}
+Protocol: TGX Finance WebSocket API v1"""
         
         else:
-            return f"🤖 I'm your crypto assistant powered by live TGX Finance data! Current BTC: {format_price(str(market_data.get('price', 'N/A')))}. Ask me about prices, volume, ranges, or market analysis!"
+            # Default response with current data
+            price = market_data.get("price", "N/A")
+            if price != "N/A":
+                return f"🤖 I'm your TGX Finance crypto assistant! Current BTC: {format_price(str(price))} ({market_data.get('change_24h', 'N/A')}% 24h). Ask me about prices, volume, ranges, or market depth!"
+            elif use_fallback:
+                fallback_price = self._fallback_data["price"]
+                return f"🤖 TGX Finance crypto assistant ready! BTC: {format_price(str(fallback_price))} (backup feed). Establishing live TGX connection..."
+            else:
+                return f"🤖 TGX Finance crypto assistant connecting... Status: {connection_status} | Messages: {message_count}. Ask about connection status or try again in a moment!"
 
     async def generate_streaming_response(self, query: str):
-        """Generate streaming response in the format expected by frontend"""
+        """Generate streaming response"""
         try:
-            response_text = self.generate_response(query)
+            # Fetch fallback data if needed
             market_data = self.ws_manager.get_market_summary()
+            if market_data.get("price", "N/A") == "N/A" and not self._fallback_data:
+                await self._fetch_fallback_data()
+            
+            response_text = self.generate_response(query)
+            market_summary = self.ws_manager.get_market_summary()
             
             # Create response in the expected format
             response_obj = {
@@ -466,7 +770,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TGX Finance Crypto Assistant",
     description="Real-time cryptocurrency assistant powered by TGX Finance WebSocket feeds",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -482,7 +786,7 @@ app.add_middleware(
 
 @app.get("/ask")
 async def ask_question(user_input: str):
-    """Main ask endpoint with streaming response (matching frontend expectation)"""
+    """Main ask endpoint with streaming response"""
     if not crypto_ai:
         return StreamingResponse(
             iter([json.dumps([{"type": "text", "id": "error", "data": "AI service not initialized"}]) + "\n"]), 
@@ -531,8 +835,10 @@ async def get_market_data():
         
         return {
             "connected": ws_manager.connected,
+            "authenticated": ws_manager._authenticated,
             "summary": summary,
             "full_data": full_data,
+            "subscriptions": full_data.get("subscriptions", []),
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
@@ -548,6 +854,7 @@ async def health_check():
         "services": {
             "websocket": {
                 "connected": ws_manager.connected if ws_manager else False,
+                "authenticated": ws_manager._authenticated if ws_manager else False,
                 "status": ws_manager._market_data.get("connection_status", "unknown") if ws_manager else "not_initialized"
             },
             "ai": {
@@ -556,7 +863,8 @@ async def health_check():
             },
             "market_data": {
                 "available": bool(ws_manager.get_full_market_data() if ws_manager else False),
-                "message_count": ws_manager._market_data.get("message_count", 0) if ws_manager else 0
+                "message_count": ws_manager._market_data.get("message_count", 0) if ws_manager else 0,
+                "subscriptions": len(ws_manager._market_data.get("subscriptions", [])) if ws_manager else 0
             }
         }
     }
@@ -566,25 +874,66 @@ async def health_check():
     
     return health_status
 
+@app.post("/subscribe")
+async def subscribe_to_feed(contract_code: str = "BTCUSDT"):
+    """Manually subscribe to a specific contract"""
+    try:
+        if not ws_manager or not ws_manager.connected:
+            raise HTTPException(status_code=503, detail="WebSocket not connected")
+        
+        subscription = {
+            "action": "sub",
+            "topic": "market.contract.switch",
+            "data": {
+                "contract_code": contract_code.upper()
+            }
+        }
+        
+        await ws_manager.connection.send(json.dumps(subscription))
+        logger.info(f"📡 Manual subscription sent for {contract_code}")
+        
+        return {
+            "status": "success",
+            "message": f"Subscription sent for {contract_code}",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Manual subscription error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 async def root():
     """API documentation root"""
     return {
         "title": "TGX Finance Crypto Assistant API",
-        "version": "2.1.0",
-        "description": "Real-time crypto assistant with live TGX Finance data",
+        "version": "2.2.0",
+        "description": "Real-time crypto assistant with live TGX Finance WebSocket data",
+        "protocol": "TGX Finance WebSocket API v1",
         "endpoints": {
             "/": "API documentation",
             "/health": "Health check and service status",
             "/market-data": "Live market data from TGX Finance",
             "/ask?user_input=<question>": "Ask crypto questions (streaming)",
-            "/api/chat": "Main chat endpoint (POST with JSON)"
+            "/api/chat": "Main chat endpoint (POST with JSON)",
+            "/subscribe": "Manual subscription to contract feeds"
         },
         "websocket_status": ws_manager.connected if ws_manager else False,
-        "market_feeds": [
+        "authenticated": ws_manager._authenticated if ws_manager else False,
+        "supported_topics": [
+            "market.contract.switch",
+            "contracts.market", 
+            "market.depth.switch",
             "market.ticker",
-            "market.contract", 
-            "market.depth"
+            "market.price.index",
+            "contract.applies"
+        ],
+        "sample_queries": [
+            "What's the current BTC price?",
+            "Show me trading volume",
+            "What's the 24h high and low?",
+            "Show market depth",
+            "Connection status"
         ]
     }
 
@@ -619,6 +968,16 @@ if __name__ == "__main__":
                 time.sleep(1)
         except Exception as e:
             logger.warning(f"Port cleanup warning: {e}")
+
+        # Print configuration info
+        logger.info(f"""
+🔧 TGX Finance Configuration:
+• WebSocket URL: {config['ws_url']}
+• App ID: {config['app_id']}
+• Authentication: {'Enabled' if config.get('token') and config.get('secret') else 'Disabled (public feeds only)'}
+• Heartbeat interval: {config['heartbeat_interval']}s
+• Port: {port}
+        """)
 
         uvicorn.run(
             app,
