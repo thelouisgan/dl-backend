@@ -1,3 +1,4 @@
+#Crispy2bogget
 #!/usr/bin/env python3
 
 import time
@@ -19,7 +20,7 @@ import uuid
 
 import websockets
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -65,17 +66,19 @@ load_dotenv()
 config = {
     "ws_url": os.getenv("WS_URL", "wss://api.tgx.finance/v1/ws/"),
     "app_id": int(os.getenv("APP_ID", "1")),
-    "token": os.getenv("TOKEN", ""),  # Optional - only needed for user-specific data
-    "secret": os.getenv("SECRET", ""),  # Optional - for authentication
+    "token": os.getenv("TOKEN", ""),
+    "secret": os.getenv("SECRET", ""),
     "ping_interval": int(os.getenv("WS_PING_INTERVAL", "30")),
     "ping_timeout": int(os.getenv("WS_PING_TIMEOUT", "10")),
     "close_timeout": int(os.getenv("WS_CLOSE_TIMEOUT", "10")),
-    "heartbeat_interval": int(os.getenv("HEARTBEAT_INTERVAL", "50")),  # 50s as per docs
+    "heartbeat_interval": int(os.getenv("HEARTBEAT_INTERVAL", "50")),
     "default_port": int(os.getenv("PORT", "8000")),
     "port_range": 100,
     "ssl_enabled": os.getenv("SSL_ENABLED", "true").lower() == "true",
     "max_reconnect_attempts": 5,
-    "reconnect_delay": 2.0
+    "reconnect_delay": 2.0,
+    "use_fallback_api": os.getenv("USE_FALLBACK_API", "true").lower() == "true",
+    "debug_mode": os.getenv("DEBUG_MODE", "false").lower() == "true"
 }
 
 # ===== Simple in-memory chat storage =====
@@ -133,14 +136,19 @@ class TGXWebSocketManager:
             "last_update": None,
             "message_count": 0,
             "latest_raw_message": {},
-            "subscriptions": []
+            "subscriptions": [],
+            "connection_attempts": 0,
+            "last_connection_attempt": None,
+            "connection_errors": [],
+            "fallback_data": {}
         }
         self._reconnect_task = None
         self._heartbeat_task = None
         self._authenticated = False
+        self._fallback_task = None
 
     async def connect(self):
-        """Connect to TGX Finance WebSocket"""
+        """Connect to TGX Finance WebSocket with enhanced error tracking"""
         if self.connected and self.connection is not None:
             try:
                 if hasattr(self.connection, 'closed') and not self.connection.closed:
@@ -153,10 +161,17 @@ class TGXWebSocketManager:
 
         max_retries = config["max_reconnect_attempts"]
         retry_count = 0
+        
+        self._market_data["connection_attempts"] += 1
+        self._market_data["last_connection_attempt"] = datetime.now().isoformat()
+
+        # Start fallback data fetching if enabled
+        if config["use_fallback_api"] and not self._fallback_task:
+            self._fallback_task = asyncio.create_task(self._fallback_data_loop())
 
         while retry_count < max_retries and not self._stop_event.is_set():
             try:
-                logger.info(f"Connecting to TGX Finance WebSocket: {config['ws_url']} (attempt {retry_count + 1})")
+                logger.info(f"🔄 Connecting to TGX Finance WebSocket: {config['ws_url']} (attempt {retry_count + 1}/{max_retries})")
                 
                 ssl_context = None
                 if config["ssl_enabled"]:
@@ -174,6 +189,7 @@ class TGXWebSocketManager:
                 
                 self.connected = True
                 self._market_data["connection_status"] = "connected"
+                self._market_data["connection_errors"].clear()  # Clear previous errors
                 logger.info("✅ Connected to TGX Finance successfully!")
 
                 # Authenticate if credentials are provided
@@ -192,13 +208,109 @@ class TGXWebSocketManager:
                 break
                 
             except Exception as e:
+                error_msg = f"Connection attempt {retry_count + 1} failed: {str(e)}"
+                logger.error(error_msg)
+                
+                # Track connection errors
+                self._market_data["connection_errors"].append({
+                    "attempt": retry_count + 1,
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
+                })
+                
                 self.connected = False
                 self.connection = None
-                self._market_data["connection_status"] = "disconnected"
-                logger.error(f"Connection failed: {e}")
+                self._market_data["connection_status"] = f"failed_attempt_{retry_count + 1}"
                 retry_count += 1
+                
                 if retry_count < max_retries:
+                    logger.info(f"⏳ Retrying in {config['reconnect_delay']} seconds...")
                     await asyncio.sleep(config["reconnect_delay"])
+        
+        if retry_count >= max_retries:
+            self._market_data["connection_status"] = "failed_max_retries"
+            logger.error(f"❌ Failed to connect after {max_retries} attempts. Using fallback data only.")
+
+    async def _fallback_data_loop(self):
+        """Continuously fetch fallback data from public APIs"""
+        while not self._stop_event.is_set():
+            try:
+                await self._fetch_fallback_data()
+                await asyncio.sleep(60)  # Fetch every minute
+            except Exception as e:
+                logger.error(f"Fallback data loop error: {e}")
+                await asyncio.sleep(30)
+
+    async def _fetch_fallback_data(self):
+        """Fetch data from multiple public APIs as fallback"""
+        fallback_sources = [
+            {
+                "name": "CoinGecko",
+                "url": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true",
+                "parser": self._parse_coingecko_data
+            },
+            {
+                "name": "CoinDesk",
+                "url": "https://api.coindesk.com/v1/bpi/currentprice.json",
+                "parser": self._parse_coindesk_data
+            }
+        ]
+        
+        for source in fallback_sources:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(source["url"], timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            parsed_data = source["parser"](data)
+                            if parsed_data:
+                                self._market_data["fallback_data"] = {
+                                    **parsed_data,
+                                    "source": source["name"],
+                                    "timestamp": datetime.now().isoformat(),
+                                    "last_update": datetime.now().isoformat()
+                                }
+                                logger.info(f"📡 Fallback data updated from {source['name']}")
+                                return True
+            except Exception as e:
+                logger.warning(f"Failed to fetch from {source['name']}: {e}")
+                continue
+        
+        return False
+
+    def _parse_coingecko_data(self, data):
+        """Parse CoinGecko API response"""
+        try:
+            return {
+                "btc": {
+                    "price": str(data["bitcoin"]["usd"]),
+                    "change_24h": str(data["bitcoin"].get("usd_24h_change", 0)),
+                    "symbol": "BTCUSDT"
+                },
+                "eth": {
+                    "price": str(data["ethereum"]["usd"]),
+                    "change_24h": str(data["ethereum"].get("usd_24h_change", 0)),
+                    "symbol": "ETHUSDT"
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error parsing CoinGecko data: {e}")
+            return None
+
+    def _parse_coindesk_data(self, data):
+        """Parse CoinDesk API response"""
+        try:
+            btc_price = data["bpi"]["USD"]["rate"].replace(",", "").replace("$", "")
+            return {
+                "btc": {
+                    "price": btc_price,
+                    "change_24h": "0.00",  # CoinDesk doesn't provide change
+                    "symbol": "BTCUSDT"
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error parsing CoinDesk data: {e}")
+            return None
 
     async def _authenticate(self):
         """Authenticate with TGX Finance (optional)"""
@@ -264,43 +376,35 @@ class TGXWebSocketManager:
             await self._cleanup_connection()
 
     async def _subscribe_to_feeds(self):
-        """Subscribe to TGX Finance data feeds using correct protocol"""
+        """Subscribe to TGX Finance data feeds using correct protocol - FIXED TO INCLUDE ETH"""
         if not self.connection or not self.connected:
             logger.warning("Cannot subscribe - not connected")
             return
     
         try:
-            logger.info("📡 Subscribing to TGX Finance feeds...")
-            
-
-            btc_switch_sub = {
+            await self.connection.send(json.dumps({
                 "action": "sub",
                 "topic": "market.contract.switch",
-                "data": {
-                    "contract_code": "BTCUSDT"
-                }
-            }
-            await self.connection.send(json.dumps(btc_switch_sub))
-            logger.info(f"📊 Subscribed to BTC contract feed")
-            await asyncio.sleep(0.5)
-            
-            # 2. Subscribe to all contracts market data
-            all_contracts_sub = {
+                "data": {"contract_code": "BTCUSDT"}
+            }))
+        
+        # Subscribe to ETH (NEW)
+            await self.connection.send(json.dumps({
+                "action": "sub",
+                "topic": "market.contract.switch",
+                "data": {"contract_code": "ETHUSDT"} 
+            }))
+        
+        # Subscribe to all contracts
+            await self.connection.send(json.dumps({
                 "action": "sub",
                 "topic": "contracts.market",
                 "data": {}
-            }
-            await self.connection.send(json.dumps(all_contracts_sub))
-            logger.info(f"📈 Subscribed to all contracts market feed")
-            await asyncio.sleep(0.5)
-            
-            self._market_data["subscriptions"] = [
-                "market.contract.switch:BTCUSDT",
-                "contracts.market",
-            ]
+            }))
             
         except Exception as e:
-            logger.error(f"Subscription error: {e}")
+            logger.error(f"Subscription error: {e}")    
+            
 
     async def _listen_messages(self):
         """Listen for incoming messages with TGX protocol handling"""
@@ -312,7 +416,7 @@ class TGXWebSocketManager:
                 try:
                     message = await asyncio.wait_for(
                         self.connection.recv(), 
-                        timeout=120.0  # Longer timeout for TGX
+                        timeout=120.0
                     )
                     
                     consecutive_errors = 0
@@ -357,7 +461,8 @@ class TGXWebSocketManager:
     async def _process_tgx_message(self, message: str):
         """Process TGX Finance messages according to protocol specification"""
         try:
-            logger.info(f"📨 Raw TGX message: {message[:300]}...")
+            if config["debug_mode"]:
+                logger.info(f"📨 Raw TGX message: {message[:300]}...")
             
             data = json.loads(message)
             self._market_data["message_count"] += 1
@@ -414,7 +519,7 @@ class TGXWebSocketManager:
                     ticker_key = "btc_ticker" if "BTC" in contract_code else "eth_ticker" if "ETH" in contract_code else None
 
                     if ticker_key:
-                    # Update ticker data
+                        # Update ticker data
                         self._market_data[ticker_key].update({
                             "contract_code": contract_code,
                             "price": price,
@@ -422,7 +527,7 @@ class TGXWebSocketManager:
                             "timestamp": timestamp or int(time.time())
                         })
                     
-                    # Add to price history
+                        # Add to price history
                         if price:
                             self._market_data["price_history"].append({
                                 "symbol": "BTC" if ticker_key == "btc_ticker" else "ETH",
@@ -435,7 +540,7 @@ class TGXWebSocketManager:
                         logger.info(f"📈 TRADE UPDATE: {contract_code} @ {price}")
 
             elif topic == "market.price.index":
-            # Contract index price push
+                # Contract index price push
                 contract_code = data.get("contract_code", "").upper()
                 price = data.get("price", "")
                 spot_price = data.get("spot_index_price", "")
@@ -451,10 +556,9 @@ class TGXWebSocketManager:
                     })
                 
                     logger.info(f"📊 INDEX UPDATE: {contract_code} Index: {price}, Spot: {spot_price}")
-                    
 
             elif topic == "contracts.market":
-            # All contracts market data
+                # All contracts market data
                 if isinstance(data, list):
                     for contract in data:
                         contract_code = contract.get("contract_code", "").upper()
@@ -464,7 +568,6 @@ class TGXWebSocketManager:
                             ticker_key = "btc_ticker"
                         elif "ETH" in contract_code:
                             ticker_key = "eth_ticker"
-
 
                         if ticker_key:
                             self._market_data[ticker_key].update({
@@ -479,9 +582,8 @@ class TGXWebSocketManager:
 
                             logger.info(f"💰 MARKET UPDATE: {contract_code} @ {contract.get('price', 'N/A')} ({contract.get('change_ratio', 'N/A')}%)")
 
-
             elif topic == "contract.applies":
-            # Contract change ratio update
+                # Contract change ratio update
                 contract_code = data.get("contract_code", "").upper()
                 change_ratio = data.get("change_ratio", "")
                 change = data.get("change", "")
@@ -508,11 +610,11 @@ class TGXWebSocketManager:
                     logger.info(f"📊 STATS UPDATE: {contract_code} Change: {change_ratio}%, High: {high_price}, Low: {low_price}")
             
             else:
-                logger.info(f"🔍 Unhandled notification topic: {topic}")
+                if config["debug_mode"]:
+                    logger.info(f"🔍 Unhandled notification topic: {topic}")
             
         except Exception as e:
             logger.error(f"Notification handling error for topic {topic}: {e}")
-            
 
     async def _reconnect_with_delay(self):
         """Reconnect after a delay"""
@@ -533,50 +635,58 @@ class TGXWebSocketManager:
         self._market_data["connection_status"] = "disconnected"
 
     def get_market_summary(self) -> Dict[str, Any]:
-        """Get a formatted market summary"""
+        """Get a formatted market summary with fallback data"""
         btc_ticker = self._market_data.get("btc_ticker", {})
         eth_ticker = self._market_data.get("eth_ticker", {})
+        fallback_data = self._market_data.get("fallback_data", {})
 
-
+        # Use TGX data if available, otherwise use fallback
+        btc_data = btc_ticker if btc_ticker.get("price") else fallback_data.get("btc", {})
+        eth_data = eth_ticker if eth_ticker.get("price") else fallback_data.get("eth", {})
 
         summary = {
             "btc": {
-                "symbol": btc_ticker.get("contract_code", "BTCUSDT"),
-                "price": btc_ticker.get("price", "N/A"),
-                "index_price": btc_ticker.get("index_price", "N/A"),
-                "change_24h": btc_ticker.get("change_ratio", "N/A"),
-                "change_abs": btc_ticker.get("change", "N/A"),
-                "volume": btc_ticker.get("volume_24h", "N/A"),
-                "high_24h": btc_ticker.get("high_24h", "N/A"),
-                "low_24h": btc_ticker.get("low_24h", "N/A"),
-                "buy_count": btc_ticker.get("buy_count", 0),
-                "sell_count": btc_ticker.get("sell_count", 0),
+                "symbol": btc_data.get("contract_code", btc_data.get("symbol", "BTCUSDT")),
+                "price": btc_data.get("price", "N/A"),
+                "index_price": btc_data.get("index_price", "N/A"),
+                "change_24h": btc_data.get("change_ratio", "N/A"),
+                "change_abs": btc_data.get("change", "N/A"),
+                "volume": btc_data.get("volume_24h", "N/A"),
+                "high_24h": btc_data.get("high_24h", "N/A"),
+                "low_24h": btc_data.get("low_24h", "N/A"),
+                "buy_count": btc_data.get("buy_count", 0),
+                "sell_count": btc_data.get("sell_count", 0),
+                "data_source": "TGX Live" if btc_ticker.get("price") else f"Fallback ({fallback_data.get('source', 'N/A')})"
             },
         
             "eth": {
-                "symbol": eth_ticker.get("contract_code", "ETHUSDT"),
-                "price": eth_ticker.get("price", "N/A"),
-                "index_price": eth_ticker.get("index_price", "N/A"),
-                "change_24h": eth_ticker.get("change_ratio", "N/A"),
-                "change_abs": eth_ticker.get("change", "N/A"),
-                "volume": eth_ticker.get("volume_24h", "N/A"),
-                "high_24h": eth_ticker.get("high_24h", "N/A"),
-                "low_24h": eth_ticker.get("low_24h", "N/A"),
-                "buy_count": eth_ticker.get("buy_count", 0),
-                "sell_count": eth_ticker.get("sell_count", 0),
+                "symbol": eth_data.get("contract_code", eth_data.get("symbol", "ETHUSDT")),
+                "price": eth_data.get("price", "N/A"),
+                "index_price": eth_data.get("index_price", "N/A"),
+                "change_24h": eth_data.get("change_ratio", "N/A"),
+                "change_abs": eth_data.get("change", "N/A"),
+                "volume": eth_data.get("volume_24h", "N/A"),
+                "high_24h": eth_data.get("high_24h", "N/A"),
+                "low_24h": eth_data.get("low_24h", "N/A"),
+                "buy_count": eth_data.get("buy_count", 0),
+                "sell_count": eth_data.get("sell_count", 0),
+                "data_source": "TGX Live" if eth_ticker.get("price") else f"Fallback ({fallback_data.get('source', 'N/A')})"
             },
             "connection_status": self._market_data["connection_status"],
             "last_update": self._market_data["last_update"],
             "message_count": self._market_data["message_count"],
             "authenticated": self._authenticated,
             "subscriptions": len(self._market_data["subscriptions"]),
+            "has_fallback_data": bool(fallback_data),
+            "fallback_source": fallback_data.get("source", "N/A"),
+            "connection_attempts": self._market_data["connection_attempts"],
+            "connection_errors": len(self._market_data["connection_errors"])
         }
     
         return summary
-     
 
     def get_full_market_data(self) -> Dict[str, Any]:
-        """Get all market data"""
+        """Get all market data including debug info"""
         return self._market_data.copy()
 
     async def close(self):
@@ -589,6 +699,9 @@ class TGXWebSocketManager:
             
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
+
+        if self._fallback_task and not self._fallback_task.done():
+            self._fallback_task.cancel()
             
         await self._cleanup_connection()
         logger.info("✅ TGX Finance connection closed")
@@ -597,138 +710,155 @@ class TGXWebSocketManager:
 class CryptoAI:
     def __init__(self, ws_manager: TGXWebSocketManager):
         self.ws_manager = ws_manager
-        self._fallback_data = {}
-        self._last_fallback_fetch = None
-        
-    async def _fetch_fallback_data(self):
-        """Fetch data from a public API as fallback"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get('https://api.coindesk.com/v1/bpi/currentprice.json', timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        btc_price = data['bpi']['USD']['rate'].replace(',', '')
-                        self._fallback_data = {
-                            "price": float(btc_price),
-                            "source": "CoinDesk API",
-                            "timestamp": datetime.now().isoformat()
-                        }
-                        self._last_fallback_fetch = datetime.now()
-                        logger.info(f"📡 Fallback data fetched: BTC ${btc_price}")
-                        return True
-        except Exception as e:
-            logger.warning(f"Fallback API fetch failed: {e}")
-        
-        return False
         
     def generate_response(self, query: str) -> str:
-        """Generate AI-like responses based on query and market data"""
+        """Generate AI-like responses based on query and market data with fallback support"""
         query_lower = query.lower()
         market_data = self.ws_manager.get_market_summary()
         
         connection_status = market_data.get("connection_status", "unknown")
         message_count = market_data.get("message_count", 0)
-        authenticated = market_data.get("authenticated", False)
+  
+
+        btc_data = market_data.get("btc", {})
+        eth_data = market_data.get("eth", {})
+
+
+        logger.info(f"BTC Data: {btc_data}")
+        logger.info(f"ETH Data: {eth_data}")
         
-        # Check if we should use fallback data
-        use_fallback = (market_data.get("btc", {}).get("price", "N/A") == "N/A" and 
-                       self._fallback_data.get("price") is not None)
+        def format_coin_response(coin: str, data: dict) -> str:
+            symbol = data.get("symbol", "N/A")
+            price = data.get("price", "N/A")
+            index_price = data.get("index_price", "N/A")
+            change = data.get("change_24h", "N/A")
+            data_source = data.get("data_source", "Unknown")
+
+            if price == "N/A":
+                return None
         
-        if any(word in query_lower for word in ["price", "cost", "value", "btc", "bitcoin"]):
-            btc_data = market_data.get("btc", {})
-            price = btc_data.get("price", "N/A")
-            index_price = btc_data.get("index_price", "N/A")
-            change = btc_data.get("change_24h", "N/A")
+            response = f"💎 {coin} ({symbol}) is currently trading at {format_price(str(price))}"
+            if index_price != "N/A":
+                response += f" (Index: {format_price(str(index_price))})"
+            if change != "N/A":
+                response += f". The 24h change is {change}%"
+            response += f". Data source: {data_source}"
+            return response
+                
+        # ETH price queries - FIXED TO HANDLE ETH PROPERLY
+        if any(word in query_lower for word in ["eth", "ethereum"]):
+            eth_response = format_coin_response("Ethereum", eth_data)
+            if eth_response:
+                return eth_response
+            return f"💎 Ethereum price data is currently unavailable. Connection: {connection_status}"
             
-            if price != "N/A":
-                response = f"💰 Bitcoin (BTC) is currently trading at {format_price(str(price))}"
-                if index_price != "N/A":
-                    response += f" (Index: {format_price(str(index_price))})"
-                if change != "N/A":
-                    response += f". The 24h change is {change}%"
-                response += ". Data is live from TGX Finance!"
-                return response
-            elif use_fallback:
-                fallback_price = self._fallback_data["price"]
-                source = self._fallback_data["source"]
-                return f"💰 Bitcoin (BTC) is currently trading at {format_price(str(fallback_price))} (via {source} - TGX Finance: {connection_status}). TGX live data coming soon!"
-            else:
-                return f"💰 Bitcoin price data is currently unavailable. Connection: {connection_status} | Messages: {message_count} | Auth: {'✅' if authenticated else '❌'}"
+        elif any(word in query_lower for word in ["btc", "bitcoin"]):
+            btc_response = format_coin_response("Bitcoin", btc_data)
+            if btc_response:
+                return btc_response
+            return f"💰 Bitcoin price data is currently unavailable. Connection: {connection_status}"
         
+
+        elif any(word in query_lower for word in ["price", "cost", "value", "how much"]):
+            responses = []
+            btc_response = format_coin_response("Bitcoin", btc_data)
+            eth_response = format_coin_response("Ethereum", eth_data)
+        
+            if btc_response:
+                responses.append(btc_response)
+            if eth_response:
+                responses.append(eth_response)
+            
+            if responses:
+                return "\n\n".join(responses)
+            return "❌ Crypto price data is currently unavailable. Please try again later."
+
         elif any(word in query_lower for word in ["volume", "trading", "activity", "buy", "sell"]):
-            btc_data = market_data.get("btc", {})
-            volume = btc_data.get("volume", "N/A")
-            buy_count = btc_data.get("buy_count", 0)
-            sell_count = btc_data.get("sell_count", 0)
+            btc_volume = btc_data.get("volume", "N/A")
+            eth_volume = eth_data.get("volume", "N/A")
+            data_source = btc_data.get("data_source", "Unknown")
+        
+            response = f"📊 Trading Volume ({data_source}):"
+            if btc_volume != "N/A":
+                response += f"\n• BTC 24h Volume: {btc_volume}"
+            if eth_volume != "N/A":
+                response += f"\n• ETH 24h Volume: {eth_volume}"
             
-            response = f"📊 Trading Data:"
-            if volume != "N/A":
-                response += f"\n• 24h Volume: {volume}"
-            if buy_count or sell_count:
-                response += f"\n• Bullish traders: {buy_count}"
-                response += f"\n• Bearish traders: {sell_count}"
-                sentiment = "Bullish" if buy_count > sell_count else "Bearish" if sell_count > buy_count else "Neutral"
-                response += f"\n• Market sentiment: {sentiment}"
-            
-            if volume == "N/A" and not buy_count and not sell_count:
-                response = f"📊 Trading volume data is currently unavailable. Connection: {connection_status}"
-            
+            if btc_volume == "N/A" and eth_volume == "N/A":
+                response = "📊 Trading volume data is currently unavailable."
+        
             return response
         
         elif any(word in query_lower for word in ["high", "low", "range", "24h"]):
-            btc_data = market_data.get("btc", {})
-            high = btc_data.get("high_24h", "N/A")
-            low = btc_data.get("low_24h", "N/A")
-            change = btc_data.get("change_abs", "N/A")
+            response = "📈 24h Price Ranges:"
+        
+        # BTC range
+            btc_high = btc_data.get("high_24h", "N/A")
+            btc_low = btc_data.get("low_24h", "N/A")
+            if btc_high != "N/A" or btc_low != "N/A":
+                response += f"\n🟠 BTC:"
+                if btc_high != "N/A":
+                    response += f" High: {format_price(str(btc_high))}"
+                if btc_low != "N/A":
+                    response += f" Low: {format_price(str(btc_low))}"
+
+            eth_high = eth_data.get("high_24h", "N/A")
+            eth_low = eth_data.get("low_24h", "N/A")
+            if eth_high != "N/A" or eth_low != "N/A":
+                response += f"\n🔵 ETH:"
+                if eth_high != "N/A":
+                    response += f" High: {format_price(str(eth_high))}"
+                if eth_low != "N/A":
+                    response += f" Low: {format_price(str(eth_low))}"
+
+            if (btc_high == "N/A" and btc_low == "N/A" and 
+                eth_high == "N/A" and eth_low == "N/A"):
+                response = "📈 Price range data is currently unavailable."
             
-            if high != "N/A" or low != "N/A":
-                response = f"📈 24h BTC Range:"
-                if high != "N/A":
-                    response += f"\n• High: {format_price(str(high))}"
-                if low != "N/A":
-                    response += f"\n• Low: {format_price(str(low))}"
-                if change != "N/A":
-                    response += f"\n• Net Change: {change}"
-                return response
-            else:
-                return f"📈 Price range data is currently unavailable. Status: {connection_status}"
+            return response
         
-        
-        elif any(word in query_lower for word in ["status", "connection", "working", "online", "debug"]):
+        elif any(word in query_lower for word in ["debug", "status", "connection", "working", "online"]):
             full_data = self.ws_manager.get_full_market_data()
             subscriptions = full_data.get("subscriptions", [])
+            connection_errors = full_data.get("connection_errors", [])
+
+            debug_info = f"""🔍 System Status:
+    • Connection: {connection_status}
+    • Messages received: {message_count}
+    • BTC Price: {btc_data.get('price', 'N/A')}
+    • ETH Price: {eth_data.get('price', 'N/A')}
+    • BTC Change: {btc_data.get('change_24h', 'N/A')}%
+    • ETH Change: {eth_data.get('change_24h', 'N/A')}%
+    • Last update: {market_data.get('last_update', 'Never')}""" 
             
-            return f"""🔍 **TGX Finance System Status:**
-• Connection: {connection_status}
-• Authentication: {'✅ Authenticated' if authenticated else '❌ Not authenticated'}
-• Messages received: {message_count}
-• Active subscriptions: {len(subscriptions)}
-• Last update: {market_data.get('last_update', 'Never')}
+            if connection_errors:
+                debug_info += f"\n\nRecent Errors:"
+                for error in connection_errors[-3:]:
+                    debug_info += f"\n• {error.get('error', 'Unknown error')}"
+                
+            return debug_info
 
 
-Subscribed feeds: {', '.join(subscriptions) if subscriptions else 'None'}
-Protocol: TGX Finance WebSocket API v1"""
-        
         else:
-            # Default response with current data
-            btc_data = market_data.get("btc", {})
-            price = btc_data.get("price", "N/A")
-            if price != "N/A":
-                return f"🤖 I'm your TGX Finance crypto assistant! Current BTC: {format_price(str(price))} ({btc_data.get('change_24h', 'N/A')}% 24h). Ask me about prices, volume or ranges!"
-            elif use_fallback:
-                fallback_price = self._fallback_data["price"]
-                return f"🤖 TGX Finance crypto assistant ready! BTC: {format_price(str(fallback_price))} (backup feed). Establishing live TGX connection..."
-            else:
-                return f"🤖 TGX Finance crypto assistant connecting... Status: {connection_status} | Messages: {message_count}. Ask about connection status or try again in a moment!"
+            responses = []
+            btc_response = format_coin_response("Bitcoin", btc_data)
+            eth_response = format_coin_response("Ethereum", eth_data)
+        
+            if btc_response:
+                responses.append(btc_response)
+            if eth_response:
+                responses.append(eth_response)
+            
+            if responses:
+                return "🤖 Crypto Market Update:\n\n" + "\n\n".join(responses)
+        
+            status_emoji = "🔄" if connection_status == "connecting" else "⚠️"
+            return f"{status_emoji} System status: {connection_status} | Messages: {message_count}"
+
 
     async def generate_streaming_response(self, query: str):
         """Generate streaming response"""
         try:
-            # Fetch fallback data if needed
-            market_data = self.ws_manager.get_market_summary()
-            if market_data.get("btc", {}).get("price", "N/A") == "N/A" and not self._fallback_data:
-                await self._fetch_fallback_data()
-            
             response_text = self.generate_response(query)
             market_summary = self.ws_manager.get_market_summary()
             
@@ -782,8 +912,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TGX Finance Crypto Assistant",
-    description="Real-time cryptocurrency assistant powered by TGX Finance WebSocket feeds",
-    version="2.2.0",
+    description="Real-time cryptocurrency assistant powered by TGX Finance WebSocket feeds with fallback support",
+    version="2.3.0",
     lifespan=lifespan
 )
 
@@ -799,19 +929,16 @@ app.add_middleware(
 
 @app.get("/ask")
 async def ask_question(user_input: str):
-    """Main ask endpoint with streaming response"""
+    """Main ask endpoint with streaming response - FIXED TO RETURN PLAIN TEXT"""
     if not crypto_ai:
-        return StreamingResponse(
-            iter([json.dumps([{"type": "text", "id": "error", "data": "AI service not initialized"}]) + "\n"]), 
-            media_type="text/plain"
-        )
+        return PlainTextResponse("AI service not initialized", status_code=503)
     
     logger.info(f"💬 Received query: '{user_input}'")
     
-    return StreamingResponse(
-        crypto_ai.generate_streaming_response(user_input),
-        media_type="text/plain"
-    )
+    # Generate response as plain text instead of streaming JSON
+    response_text = crypto_ai.generate_response(user_input)
+    
+    return PlainTextResponse(response_text)
 
 # ===== FRONTEND COMPATIBLE ENDPOINTS =====
 
@@ -821,6 +948,8 @@ async def frontend_chat_endpoint(request: FrontendChatRequest):
     try:
         if not crypto_ai:
             raise HTTPException(status_code=503, detail="AI service not initialized")
+        
+        logger.info(f"📱 Frontend chat request: '{request.user_input}'")
         
         # Generate a new chat ID
         chat_id = str(uuid.uuid4())
@@ -847,11 +976,11 @@ async def frontend_chat_endpoint(request: FrontendChatRequest):
             market_data=market_summary
         )
         
-        logger.info(f"💬 Created chat {chat_id}: '{request.user_input}' | Response: {len(ai_response)} chars")
+        logger.info(f"✅ Created chat {chat_id}: Response length {len(ai_response)} chars | Connection: {market_summary.get('connection_status', 'unknown')}")
         return response
         
     except Exception as e:
-        logger.error(f"Frontend chat endpoint error: {e}")
+        logger.error(f"❌ Frontend chat endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"Chat service error: {str(e)}")
 
 @app.post("/api/chat/{chat_id}/stream")
@@ -860,6 +989,8 @@ async def frontend_stream_endpoint(chat_id: str, request: FrontendChatRequest):
     try:
         if not crypto_ai:
             raise HTTPException(status_code=503, detail="AI service not initialized")
+        
+        logger.info(f"🌊 Frontend stream request for chat {chat_id}: '{request.user_input}'")
         
         # Check if chat exists, create if not
         if chat_id not in chat_sessions:
@@ -888,11 +1019,11 @@ async def frontend_stream_endpoint(chat_id: str, request: FrontendChatRequest):
             market_data=market_summary
         )
         
-        logger.info(f"💬 Stream chat {chat_id}: '{request.user_input}' | Response: {len(ai_response)} chars")
+        logger.info(f"✅ Stream chat {chat_id}: Response length {len(ai_response)} chars | Connection: {market_summary.get('connection_status', 'unknown')}")
         return response
         
     except Exception as e:
-        logger.error(f"Frontend stream endpoint error: {e}")
+        logger.error(f"❌ Frontend stream endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"Stream service error: {str(e)}")
 
 @app.get("/api/chat/{chat_id}")
@@ -955,7 +1086,7 @@ async def legacy_chat_endpoint(request: ChatRequest):
 
 @app.get("/market-data")
 async def get_market_data():
-    """Get comprehensive market data"""
+    """Get comprehensive market data including debug information"""
     try:
         if not ws_manager:
             raise HTTPException(status_code=503, detail="WebSocket manager not initialized")
@@ -969,6 +1100,10 @@ async def get_market_data():
             "summary": summary,
             "full_data": full_data,
             "subscriptions": full_data.get("subscriptions", []),
+            "connection_attempts": full_data.get("connection_attempts", 0),
+            "connection_errors": full_data.get("connection_errors", []),
+            "has_fallback_data": bool(full_data.get("fallback_data")),
+            "fallback_source": full_data.get("fallback_data", {}).get("source", "N/A"),
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
@@ -977,7 +1112,7 @@ async def get_market_data():
 
 @app.get("/health")
 async def health_check():
-    """Comprehensive health check"""
+    """Comprehensive health check with debug info"""
     health_status = {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -985,7 +1120,9 @@ async def health_check():
             "websocket": {
                 "connected": ws_manager.connected if ws_manager else False,
                 "authenticated": ws_manager._authenticated if ws_manager else False,
-                "status": ws_manager._market_data.get("connection_status", "unknown") if ws_manager else "not_initialized"
+                "status": ws_manager._market_data.get("connection_status", "unknown") if ws_manager else "not_initialized",
+                "connection_attempts": ws_manager._market_data.get("connection_attempts", 0) if ws_manager else 0,
+                "connection_errors": len(ws_manager._market_data.get("connection_errors", [])) if ws_manager else 0
             },
             "ai": {
                 "available": crypto_ai is not None,
@@ -994,17 +1131,25 @@ async def health_check():
             "market_data": {
                 "available": bool(ws_manager.get_full_market_data() if ws_manager else False),
                 "message_count": ws_manager._market_data.get("message_count", 0) if ws_manager else 0,
-                "subscriptions": len(ws_manager._market_data.get("subscriptions", [])) if ws_manager else 0
+                "subscriptions": len(ws_manager._market_data.get("subscriptions", [])) if ws_manager else 0,
+                "has_fallback": bool(ws_manager._market_data.get("fallback_data")) if ws_manager else False,
+                "fallback_source": ws_manager._market_data.get("fallback_data", {}).get("source", "N/A") if ws_manager else "N/A"
             },
             "chat_sessions": {
                 "active": len(chat_sessions),
                 "total_messages": sum(len(session.get("messages", [])) for session in chat_sessions.values())
             }
-        }
+        },
+        "debug_mode": config.get("debug_mode", False),
+        "fallback_enabled": config.get("use_fallback_api", True)
     }
     
     if not ws_manager or not ws_manager.connected or not crypto_ai:
         health_status["status"] = "degraded"
+        
+    # Add detailed connection info if available
+    if ws_manager and ws_manager._market_data.get("connection_errors"):
+        health_status["recent_errors"] = ws_manager._market_data["connection_errors"][-3:]  # Last 3 errors
     
     return health_status
 
@@ -1036,14 +1181,67 @@ async def subscribe_to_feed(contract_code: str = "BTCUSDT"):
         logger.error(f"Manual subscription error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/debug")
+async def debug_endpoint():
+    """Enhanced debug endpoint with comprehensive system information"""
+    try:
+        if not ws_manager:
+            return {"error": "WebSocket manager not initialized"}
+            
+        full_data = ws_manager.get_full_market_data()
+        summary = ws_manager.get_market_summary()
+        
+        debug_info = {
+            "system": {
+                "config": {k: v for k, v in config.items() if k not in ["token", "secret"]},  # Hide sensitive data
+                "chat_sessions_count": len(chat_sessions),
+                "python_version": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}"
+            },
+            "websocket": {
+                "connected": ws_manager.connected,
+                "authenticated": ws_manager._authenticated,
+                "connection_status": full_data.get("connection_status"),
+                "connection_attempts": full_data.get("connection_attempts", 0),
+                "message_count": full_data.get("message_count", 0),
+                "subscriptions": full_data.get("subscriptions", []),
+                "last_update": full_data.get("last_update"),
+                "connection_errors": full_data.get("connection_errors", [])
+            },
+            "market_data": {
+                "btc_ticker": full_data.get("btc_ticker", {}),
+                "eth_ticker": full_data.get("eth_ticker", {}),
+                "price_history_count": len(full_data.get("price_history", [])),
+                "fallback_data": full_data.get("fallback_data", {}),
+                "latest_raw_message": full_data.get("latest_raw_message", {})
+            },
+            "summary": summary,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return debug_info
+        
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {e}")
+        return {"error": str(e), "timestamp": datetime.now().isoformat()}
+
 @app.get("/")
 async def root():
-    """API documentation root"""
+    """API documentation root with enhanced information"""
+    market_summary = ws_manager.get_market_summary() if ws_manager else {}
+    
     return {
         "title": "TGX Finance Crypto Assistant API",
-        "version": "2.2.0",
-        "description": "Real-time crypto assistant with live TGX Finance WebSocket data",
+        "version": "2.3.1",
+        "description": "Real-time crypto assistant with live TGX Finance WebSocket data and fallback support",
         "protocol": "TGX Finance WebSocket API v1",
+        "status": {
+            "websocket_connected": ws_manager.connected if ws_manager else False,
+            "authenticated": ws_manager._authenticated if ws_manager else False,
+            "connection_status": market_summary.get("connection_status", "unknown"),
+            "has_fallback_data": market_summary.get("has_fallback_data", False),
+            "fallback_source": market_summary.get("fallback_source", "N/A"),
+            "active_chats": len(chat_sessions)
+        },
         "frontend_endpoints": {
             "/api/chat": "Create new chat (POST with {user_input: string})",
             "/api/chat/{chat_id}/stream": "Stream chat response (POST with {user_input: string})",
@@ -1051,17 +1249,16 @@ async def root():
             "/api/chats": "List all chats (GET)",
             "/api/chat/{chat_id}": "Delete chat (DELETE)"
         },
+        "debug_endpoints": {
+            "/debug": "Comprehensive debug information",
+            "/health": "Health check with detailed status",
+            "/market-data": "Live market data with debug info"
+        },
         "legacy_endpoints": {
-            "/": "API documentation",
-            "/health": "Health check and service status", 
-            "/market-data": "Live market data from TGX Finance",
-            "/ask?user_input=<question>": "Ask crypto questions (streaming)",
+            "/ask?user_input=<question>": "Ask crypto questions (plain text response)",
             "/chat": "Legacy chat endpoint (POST with JSON)",
             "/subscribe": "Manual subscription to contract feeds"
         },
-        "websocket_status": ws_manager.connected if ws_manager else False,
-        "authenticated": ws_manager._authenticated if ws_manager else False,
-        "active_chats": len(chat_sessions),
         "supported_topics": [
             "market.contract.switch",
             "contracts.market", 
@@ -1071,10 +1268,20 @@ async def root():
         ],
         "sample_queries": [
             "What's the current BTC price?",
+            "What's the current ETH price?",
             "Show me trading volume",
             "What's the 24h high and low?",
+            "Debug status",
             "Connection status"
-        ]
+        ],
+        "features": {
+            "fallback_api": config.get("use_fallback_api", True),
+            "debug_mode": config.get("debug_mode", False),
+            "authentication": bool(config.get("token") and config.get("secret")),
+            "auto_reconnect": True,
+            "heartbeat_monitoring": True,
+            "eth_support": True
+        }
     }
 
 # ===== Signal Handlers =====
@@ -1091,7 +1298,7 @@ if __name__ == "__main__":
 
     try:
         port = find_available_port(config["default_port"], config["port_range"])
-        logger.info(f"🚀 Starting TGX Finance Crypto Bot on port {port}")
+        logger.info(f"🚀 Starting Enhanced TGX Finance Crypto Bot on port {port}")
         
         # Kill any existing processes on the port
         try:
@@ -1111,13 +1318,17 @@ if __name__ == "__main__":
 
         # Print configuration info
         logger.info(f"""
-🔧 TGX Finance Configuration:
+🔧 Enhanced TGX Finance Configuration:
 • WebSocket URL: {config['ws_url']}
 • App ID: {config['app_id']}
 • Authentication: {'Enabled' if config.get('token') and config.get('secret') else 'Disabled (public feeds only)'}
 • Heartbeat interval: {config['heartbeat_interval']}s
 • Port: {port}
+• Fallback API: {'Enabled' if config['use_fallback_api'] else 'Disabled'}
+• Debug Mode: {'Enabled' if config['debug_mode'] else 'Disabled'}
 • Frontend Compatible: ✅ (POST /api/chat, POST /api/chat/{{id}}/stream)
+• Debug Endpoints: ✅ (/debug, /health with enhanced info)
+• ETH Support: ✅ (Now subscribing to ETHUSDT feeds)
         """)
 
         uvicorn.run(
