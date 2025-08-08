@@ -1,4 +1,4 @@
-#Crispy2FINAL
+#Crispy2FINALPT2
 
 #!/usr/bin/env python3
 
@@ -109,8 +109,8 @@ class TGXWebSocketManager:
         self._stop_event = asyncio.Event()
         self._market_data = {
             "btc_ticker": {},
+            "eth_ticker": {},
             "contract_info": {},
-            "market_depth": {},
             "price_history": [],
             "connection_status": "disconnected",
             "last_update": None,
@@ -255,7 +255,7 @@ class TGXWebSocketManager:
         try:
             logger.info("📡 Subscribing to TGX Finance feeds...")
             
-            # 1. Subscribe to BTC contract switching (gets ticker, depth, contract info)
+
             btc_switch_sub = {
                 "action": "sub",
                 "topic": "market.contract.switch",
@@ -277,22 +277,9 @@ class TGXWebSocketManager:
             logger.info(f"📈 Subscribed to all contracts market feed")
             await asyncio.sleep(0.5)
             
-            # 3. Set depth precision (optional)
-            depth_precision_sub = {
-                "action": "sub",
-                "topic": "market.depth.switch",
-                "data": {
-                    "level": 2  # 0-4, where 0 is original precision
-                }
-            }
-            await self.connection.send(json.dumps(depth_precision_sub))
-            logger.info(f"📊 Set depth precision to level 2")
-            await asyncio.sleep(0.5)
-            
             self._market_data["subscriptions"] = [
                 "market.contract.switch:BTCUSDT",
                 "contracts.market",
-                "market.depth.switch:level2"
             ]
             
         except Exception as e:
@@ -406,48 +393,64 @@ class TGXWebSocketManager:
                 if trade_list:
                     latest_trade = trade_list[0]
                     price = latest_trade.get("trade_price", latest_trade.get("price", ""))
-                    
+
+                    ticker_key = "btc_ticker" if "BTC" in contract_code else "eth_ticker" if "ETH" in contract_code else None
+
+                    if ticker_key:
                     # Update ticker data
-                    self._market_data["btc_ticker"].update({
-                        "contract_code": contract_code,
-                        "price": price,
-                        "last_trade": latest_trade,
-                        "timestamp": timestamp or int(time.time())
-                    })
+                        self._market_data[ticker_key].update({
+                            "contract_code": contract_code,
+                            "price": price,
+                            "last_trade": latest_trade,
+                            "timestamp": timestamp or int(time.time())
+                        })
                     
                     # Add to price history
-                    if price:
-                        self._market_data["price_history"].append({
-                            "price": price,
-                            "timestamp": datetime.now().isoformat()
-                        })
-                        if len(self._market_data["price_history"]) > 100:
-                            self._market_data["price_history"] = self._market_data["price_history"][-100:]
-                    
-                    logger.info(f"📈 TRADE UPDATE: {contract_code} @ {price}")
-                    
+                        if price:
+                            self._market_data["price_history"].append({
+                                "symbol": "BTC" if ticker_key == "btc_ticker" else "ETH",
+                                "price": price,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            if len(self._market_data["price_history"]) > 100:
+                                self._market_data["price_history"] = self._market_data["price_history"][-100:]
+
+                        logger.info(f"📈 TRADE UPDATE: {contract_code} @ {price}")
+
             elif topic == "market.price.index":
-                # Contract index price push
-                contract_code = data.get("contract_code", "")
+            # Contract index price push
+                contract_code = data.get("contract_code", "").upper()
                 price = data.get("price", "")
                 spot_price = data.get("spot_index_price", "")
+
+                ticker_key = "btc_ticker" if "BTC" in contract_code else "eth_ticker" if "ETH" in contract_code else None
+                    
+                if ticker_key:
+                    self._market_data[ticker_key].update({
+                        "contract_code": contract_code,
+                        "index_price": price,
+                        "spot_index_price": spot_price,
+                        "timestamp": data.get("ts", timestamp)
+                    })
                 
-                self._market_data["btc_ticker"].update({
-                    "contract_code": contract_code,
-                    "index_price": price,
-                    "spot_index_price": spot_price,
-                    "timestamp": data.get("ts", timestamp)
-                })
-                
-                logger.info(f"📊 INDEX UPDATE: {contract_code} Index: {price}, Spot: {spot_price}")
-                
+                    logger.info(f"📊 INDEX UPDATE: {contract_code} Index: {price}, Spot: {spot_price}")
+                    
+
             elif topic == "contracts.market":
-                # All contracts market data
+            # All contracts market data
                 if isinstance(data, list):
                     for contract in data:
-                        contract_code = contract.get("contract_code", "")
-                        if "BTC" in contract_code.upper():
-                            self._market_data["btc_ticker"].update({
+                        contract_code = contract.get("contract_code", "").upper()
+                        ticker_key = None
+                    
+                        if "BTC" in contract_code:
+                            ticker_key = "btc_ticker"
+                        elif "ETH" in contract_code:
+                            ticker_key = "eth_ticker"
+
+
+                        if ticker_key:
+                            self._market_data[ticker_key].update({
                                 "contract_code": contract_code,
                                 "price": contract.get("price", ""),
                                 "index_price": contract.get("index_price", ""),
@@ -456,21 +459,27 @@ class TGXWebSocketManager:
                                 "buy_count": contract.get("buy_count", 0),
                                 "sell_count": contract.get("sell_count", 0)
                             })
-                            
+
                             logger.info(f"💰 MARKET UPDATE: {contract_code} @ {contract.get('price', 'N/A')} ({contract.get('change_ratio', 'N/A')}%)")
-                            break
-                            
+
+
             elif topic == "contract.applies":
-                # Contract change ratio update
-                contract_code = data.get("contract_code", "")
+            # Contract change ratio update
+                contract_code = data.get("contract_code", "").upper()
                 change_ratio = data.get("change_ratio", "")
                 change = data.get("change", "")
                 high_price = data.get("high_price", "")
                 low_price = data.get("low_price", "")
                 trade_24h = data.get("trade_24h", "")
-                
-                if "BTC" in contract_code.upper():
-                    self._market_data["btc_ticker"].update({
+
+                ticker_key = None
+                if "BTC" in contract_code:
+                    ticker_key = "btc_ticker"
+                elif "ETH" in contract_code:
+                    ticker_key = "eth_ticker"
+
+                if ticker_key:
+                    self._market_data[ticker_key].update({
                         "contract_code": contract_code,
                         "change_ratio": change_ratio,
                         "change": change,
@@ -478,31 +487,15 @@ class TGXWebSocketManager:
                         "low_24h": low_price,
                         "volume_24h": trade_24h
                     })
-                    
+                
                     logger.info(f"📊 STATS UPDATE: {contract_code} Change: {change_ratio}%, High: {high_price}, Low: {low_price}")
-                    
-            elif topic == "market.depth":
-                # Market depth data
-                contract_code = data.get("contract_code", "")
-                level = data.get("level", 0)
-                buy_orders = data.get("buy", [])
-                sell_orders = data.get("sell", [])
-                
-                self._market_data["market_depth"] = {
-                    "contract_code": contract_code,
-                    "level": level,
-                    "bids": buy_orders,
-                    "asks": sell_orders,
-                    "timestamp": timestamp or int(time.time())
-                }
-                
-                logger.info(f"📊 DEPTH UPDATE: {contract_code} Level {level} - {len(buy_orders)} bids, {len(sell_orders)} asks")
-                
+            
             else:
                 logger.info(f"🔍 Unhandled notification topic: {topic}")
-                
+            
         except Exception as e:
             logger.error(f"Notification handling error for topic {topic}: {e}")
+            
 
     async def _reconnect_with_delay(self):
         """Reconnect after a delay"""
@@ -524,29 +517,46 @@ class TGXWebSocketManager:
 
     def get_market_summary(self) -> Dict[str, Any]:
         """Get a formatted market summary"""
-        ticker = self._market_data.get("btc_ticker", {})
-        depth = self._market_data.get("market_depth", {})
-        
+        btc_ticker = self._market_data.get("btc_ticker", {})
+        eth_ticker = self._market_data.get("eth_ticker", {})
+
+
+
         summary = {
-            "symbol": ticker.get("contract_code", "BTCUSDT"),
-            "price": ticker.get("price", "N/A"),
-            "index_price": ticker.get("index_price", "N/A"),
-            "change_24h": ticker.get("change_ratio", "N/A"),
-            "change_abs": ticker.get("change", "N/A"),
-            "volume": ticker.get("volume_24h", "N/A"),
-            "high_24h": ticker.get("high_24h", "N/A"),
-            "low_24h": ticker.get("low_24h", "N/A"),
-            "buy_count": ticker.get("buy_count", 0),
-            "sell_count": ticker.get("sell_count", 0),
+            "btc": {
+                "symbol": btc_ticker.get("contract_code", "BTCUSDT"),
+                "price": btc_ticker.get("price", "N/A"),
+                "index_price": btc_ticker.get("index_price", "N/A"),
+                "change_24h": btc_ticker.get("change_ratio", "N/A"),
+                "change_abs": btc_ticker.get("change", "N/A"),
+                "volume": btc_ticker.get("volume_24h", "N/A"),
+                "high_24h": btc_ticker.get("high_24h", "N/A"),
+                "low_24h": btc_ticker.get("low_24h", "N/A"),
+                "buy_count": btc_ticker.get("buy_count", 0),
+                "sell_count": btc_ticker.get("sell_count", 0),
+            },
+        
+            "eth": {
+                "symbol": eth_ticker.get("contract_code", "ETHUSDT"),
+                "price": eth_ticker.get("price", "N/A"),
+                "index_price": eth_ticker.get("index_price", "N/A"),
+                "change_24h": eth_ticker.get("change_ratio", "N/A"),
+                "change_abs": eth_ticker.get("change", "N/A"),
+                "volume": eth_ticker.get("volume_24h", "N/A"),
+                "high_24h": eth_ticker.get("high_24h", "N/A"),
+                "low_24h": eth_ticker.get("low_24h", "N/A"),
+                "buy_count": eth_ticker.get("buy_count", 0),
+                "sell_count": eth_ticker.get("sell_count", 0),
+            },
             "connection_status": self._market_data["connection_status"],
             "last_update": self._market_data["last_update"],
             "message_count": self._market_data["message_count"],
             "authenticated": self._authenticated,
             "subscriptions": len(self._market_data["subscriptions"]),
-            "depth_available": bool(depth)
         }
-        
+    
         return summary
+     
 
     def get_full_market_data(self) -> Dict[str, Any]:
         """Get all market data"""
@@ -663,24 +673,6 @@ class CryptoAI:
             else:
                 return f"📈 Price range data is currently unavailable. Status: {connection_status}"
         
-        elif any(word in query_lower for word in ["depth", "book", "orders", "bid", "ask"]):
-            full_data = self.ws_manager.get_full_market_data()
-            depth = full_data.get("market_depth", {})
-            
-            if depth:
-                bids = depth.get("bids", [])
-                asks = depth.get("asks", [])
-                level = depth.get("level", 0)
-                
-                response = f"📊 Market Depth (Level {level}):"
-                if asks:
-                    response += f"\n• Best Ask: {asks[0].get('price', 'N/A')} ({asks[0].get('amount', 'N/A')} units)"
-                if bids:
-                    response += f"\n• Best Bid: {bids[0].get('price', 'N/A')} ({bids[0].get('amount', 'N/A')} units)"
-                response += f"\n• Total bids: {len(bids)}, Total asks: {len(asks)}"
-                return response
-            else:
-                return f"📊 Market depth data is currently unavailable. Connection: {connection_status}"
         
         elif any(word in query_lower for word in ["status", "connection", "working", "online", "debug"]):
             full_data = self.ws_manager.get_full_market_data()
@@ -692,7 +684,7 @@ class CryptoAI:
 • Messages received: {message_count}
 • Active subscriptions: {len(subscriptions)}
 • Last update: {market_data.get('last_update', 'Never')}
-• Depth data available: {'✅' if market_data.get('depth_available') else '❌'}
+
 
 Subscribed feeds: {', '.join(subscriptions) if subscriptions else 'None'}
 Protocol: TGX Finance WebSocket API v1"""
@@ -701,7 +693,7 @@ Protocol: TGX Finance WebSocket API v1"""
             # Default response with current data
             price = market_data.get("price", "N/A")
             if price != "N/A":
-                return f"🤖 I'm your TGX Finance crypto assistant! Current BTC: {format_price(str(price))} ({market_data.get('change_24h', 'N/A')}% 24h). Ask me about prices, volume, ranges, or market depth!"
+                return f"🤖 I'm your TGX Finance crypto assistant! Current BTC: {format_price(str(price))} ({market_data.get('change_24h', 'N/A')}% 24h). Ask me about prices, volume or ranges!"
             elif use_fallback:
                 fallback_price = self._fallback_data["price"]
                 return f"🤖 TGX Finance crypto assistant ready! BTC: {format_price(str(fallback_price))} (backup feed). Establishing live TGX connection..."
@@ -923,7 +915,6 @@ async def root():
         "supported_topics": [
             "market.contract.switch",
             "contracts.market", 
-            "market.depth.switch",
             "market.ticker",
             "market.price.index",
             "contract.applies"
@@ -932,7 +923,6 @@ async def root():
             "What's the current BTC price?",
             "Show me trading volume",
             "What's the 24h high and low?",
-            "Show market depth",
             "Connection status"
         ]
     }
