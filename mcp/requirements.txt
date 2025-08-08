@@ -1,0 +1,30 @@
+# MCP Crypto Analysis Server Requirements
+
+# Core MCP and FastAPI
+mcp>=0.7.0
+fastapi>=0.111.1
+uvicorn[standard]>=0.29.0
+pydantic>=2.5.0
+
+# LangChain and OpenAI
+langchain-core>=0.1.0
+langchain-openai>=0.0.2
+openai>=1.6.0
+
+# WebSocket and HTTP clients
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Database
+psycopg2-binary>=2.9.0
+pandas>=2.1.0
+
+# Utilities
+python-dotenv>=0.19.2
+python-multipart>=0.0.6
+
+# CORS middleware
+starlette>=0.27.0
+
+redis>=4.1.4
+
