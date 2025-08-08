@@ -1,5 +1,3 @@
-#Crispy2FINALPT2
-
 #!/usr/bin/env python3
 
 import time
@@ -17,6 +15,7 @@ from datetime import datetime
 import hashlib
 import hmac
 import asyncio
+import uuid
 
 import websockets
 from fastapi import FastAPI, HTTPException, Request
@@ -30,10 +29,25 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
 
+class FrontendChatRequest(BaseModel):
+    user_input: str
+
 class ChatResponse(BaseModel):
     response: str
     market_data: Optional[Dict] = None
     timestamp: str
+
+class FrontendChatResponse(BaseModel):
+    id: str
+    message: str
+    timestamp: str
+    market_data: Optional[Dict] = None
+
+class StreamResponse(BaseModel):
+    id: str
+    message: str
+    timestamp: str
+    market_data: Optional[Dict] = None
 
 # ===== Configuration =====
 logging.basicConfig(
@@ -63,6 +77,9 @@ config = {
     "max_reconnect_attempts": 5,
     "reconnect_delay": 2.0
 }
+
+# ===== Simple in-memory chat storage =====
+chat_sessions = {}
 
 def find_available_port(start_port: int, max_attempts: int) -> int:
     """Find an available port in the given range"""
@@ -614,13 +631,14 @@ class CryptoAI:
         authenticated = market_data.get("authenticated", False)
         
         # Check if we should use fallback data
-        use_fallback = (market_data.get("price", "N/A") == "N/A" and 
+        use_fallback = (market_data.get("btc", {}).get("price", "N/A") == "N/A" and 
                        self._fallback_data.get("price") is not None)
         
         if any(word in query_lower for word in ["price", "cost", "value", "btc", "bitcoin"]):
-            price = market_data.get("price", "N/A")
-            index_price = market_data.get("index_price", "N/A")
-            change = market_data.get("change_24h", "N/A")
+            btc_data = market_data.get("btc", {})
+            price = btc_data.get("price", "N/A")
+            index_price = btc_data.get("index_price", "N/A")
+            change = btc_data.get("change_24h", "N/A")
             
             if price != "N/A":
                 response = f"💰 Bitcoin (BTC) is currently trading at {format_price(str(price))}"
@@ -638,9 +656,10 @@ class CryptoAI:
                 return f"💰 Bitcoin price data is currently unavailable. Connection: {connection_status} | Messages: {message_count} | Auth: {'✅' if authenticated else '❌'}"
         
         elif any(word in query_lower for word in ["volume", "trading", "activity", "buy", "sell"]):
-            volume = market_data.get("volume", "N/A")
-            buy_count = market_data.get("buy_count", 0)
-            sell_count = market_data.get("sell_count", 0)
+            btc_data = market_data.get("btc", {})
+            volume = btc_data.get("volume", "N/A")
+            buy_count = btc_data.get("buy_count", 0)
+            sell_count = btc_data.get("sell_count", 0)
             
             response = f"📊 Trading Data:"
             if volume != "N/A":
@@ -657,9 +676,10 @@ class CryptoAI:
             return response
         
         elif any(word in query_lower for word in ["high", "low", "range", "24h"]):
-            high = market_data.get("high_24h", "N/A")
-            low = market_data.get("low_24h", "N/A")
-            change = market_data.get("change_abs", "N/A")
+            btc_data = market_data.get("btc", {})
+            high = btc_data.get("high_24h", "N/A")
+            low = btc_data.get("low_24h", "N/A")
+            change = btc_data.get("change_abs", "N/A")
             
             if high != "N/A" or low != "N/A":
                 response = f"📈 24h BTC Range:"
@@ -691,9 +711,10 @@ Protocol: TGX Finance WebSocket API v1"""
         
         else:
             # Default response with current data
-            price = market_data.get("price", "N/A")
+            btc_data = market_data.get("btc", {})
+            price = btc_data.get("price", "N/A")
             if price != "N/A":
-                return f"🤖 I'm your TGX Finance crypto assistant! Current BTC: {format_price(str(price))} ({market_data.get('change_24h', 'N/A')}% 24h). Ask me about prices, volume or ranges!"
+                return f"🤖 I'm your TGX Finance crypto assistant! Current BTC: {format_price(str(price))} ({btc_data.get('change_24h', 'N/A')}% 24h). Ask me about prices, volume or ranges!"
             elif use_fallback:
                 fallback_price = self._fallback_data["price"]
                 return f"🤖 TGX Finance crypto assistant ready! BTC: {format_price(str(fallback_price))} (backup feed). Establishing live TGX connection..."
@@ -705,7 +726,7 @@ Protocol: TGX Finance WebSocket API v1"""
         try:
             # Fetch fallback data if needed
             market_data = self.ws_manager.get_market_summary()
-            if market_data.get("price", "N/A") == "N/A" and not self._fallback_data:
+            if market_data.get("btc", {}).get("price", "N/A") == "N/A" and not self._fallback_data:
                 await self._fetch_fallback_data()
             
             response_text = self.generate_response(query)
@@ -792,9 +813,126 @@ async def ask_question(user_input: str):
         media_type="text/plain"
     )
 
+# ===== FRONTEND COMPATIBLE ENDPOINTS =====
+
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
-    """Alternative chat endpoint for JSON requests"""
+async def frontend_chat_endpoint(request: FrontendChatRequest):
+    """Frontend compatible chat endpoint - creates a new chat"""
+    try:
+        if not crypto_ai:
+            raise HTTPException(status_code=503, detail="AI service not initialized")
+        
+        # Generate a new chat ID
+        chat_id = str(uuid.uuid4())
+        
+        # Generate AI response
+        ai_response = crypto_ai.generate_response(request.user_input)
+        market_summary = ws_manager.get_market_summary() if ws_manager else {}
+        
+        # Store chat session
+        chat_sessions[chat_id] = {
+            "id": chat_id,
+            "messages": [
+                {"role": "user", "content": request.user_input, "timestamp": datetime.now().isoformat()},
+                {"role": "assistant", "content": ai_response, "timestamp": datetime.now().isoformat()}
+            ],
+            "created_at": datetime.now().isoformat(),
+            "market_data": market_summary
+        }
+        
+        response = FrontendChatResponse(
+            id=chat_id,
+            message=ai_response,
+            timestamp=datetime.now().isoformat(),
+            market_data=market_summary
+        )
+        
+        logger.info(f"💬 Created chat {chat_id}: '{request.user_input}' | Response: {len(ai_response)} chars")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Frontend chat endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=f"Chat service error: {str(e)}")
+
+@app.post("/api/chat/{chat_id}/stream")
+async def frontend_stream_endpoint(chat_id: str, request: FrontendChatRequest):
+    """Frontend compatible streaming endpoint"""
+    try:
+        if not crypto_ai:
+            raise HTTPException(status_code=503, detail="AI service not initialized")
+        
+        # Check if chat exists, create if not
+        if chat_id not in chat_sessions:
+            chat_sessions[chat_id] = {
+                "id": chat_id,
+                "messages": [],
+                "created_at": datetime.now().isoformat(),
+                "market_data": {}
+            }
+        
+        # Generate AI response
+        ai_response = crypto_ai.generate_response(request.user_input)
+        market_summary = ws_manager.get_market_summary() if ws_manager else {}
+        
+        # Update chat session
+        chat_sessions[chat_id]["messages"].extend([
+            {"role": "user", "content": request.user_input, "timestamp": datetime.now().isoformat()},
+            {"role": "assistant", "content": ai_response, "timestamp": datetime.now().isoformat()}
+        ])
+        chat_sessions[chat_id]["market_data"] = market_summary
+        
+        response = StreamResponse(
+            id=chat_id,
+            message=ai_response,
+            timestamp=datetime.now().isoformat(),
+            market_data=market_summary
+        )
+        
+        logger.info(f"💬 Stream chat {chat_id}: '{request.user_input}' | Response: {len(ai_response)} chars")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Frontend stream endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=f"Stream service error: {str(e)}")
+
+@app.get("/api/chat/{chat_id}")
+async def get_chat_session(chat_id: str):
+    """Get a specific chat session"""
+    if chat_id not in chat_sessions:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    
+    return chat_sessions[chat_id]
+
+@app.get("/api/chats")
+async def list_chat_sessions():
+    """List all chat sessions"""
+    return {
+        "chats": [
+            {
+                "id": chat_id,
+                "created_at": session["created_at"],
+                "message_count": len(session["messages"]),
+                "last_message": session["messages"][-1]["content"] if session["messages"] else None
+            }
+            for chat_id, session in chat_sessions.items()
+        ],
+        "total": len(chat_sessions)
+    }
+
+@app.delete("/api/chat/{chat_id}")
+async def delete_chat_session(chat_id: str):
+    """Delete a chat session"""
+    if chat_id not in chat_sessions:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    
+    del chat_sessions[chat_id]
+    return {"message": f"Chat session {chat_id} deleted"}
+
+# ===== ORIGINAL ENDPOINTS (BACKWARD COMPATIBILITY) =====
+
+@app.post("/chat")
+async def legacy_chat_endpoint(request: ChatRequest):
+    """Legacy chat endpoint for backward compatibility"""
     try:
         if not crypto_ai:
             raise HTTPException(status_code=503, detail="AI service not initialized")
@@ -808,11 +946,11 @@ async def chat_endpoint(request: ChatRequest):
             timestamp=datetime.now().isoformat()
         )
         
-        logger.info(f"💬 Chat query: '{request.message}' | Response: {len(ai_response)} chars")
+        logger.info(f"💬 Legacy chat query: '{request.message}' | Response: {len(ai_response)} chars")
         return response
         
     except Exception as e:
-        logger.error(f"Chat endpoint error: {e}")
+        logger.error(f"Legacy chat endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"Chat service error: {str(e)}")
 
 @app.get("/market-data")
@@ -857,6 +995,10 @@ async def health_check():
                 "available": bool(ws_manager.get_full_market_data() if ws_manager else False),
                 "message_count": ws_manager._market_data.get("message_count", 0) if ws_manager else 0,
                 "subscriptions": len(ws_manager._market_data.get("subscriptions", [])) if ws_manager else 0
+            },
+            "chat_sessions": {
+                "active": len(chat_sessions),
+                "total_messages": sum(len(session.get("messages", [])) for session in chat_sessions.values())
             }
         }
     }
@@ -902,16 +1044,24 @@ async def root():
         "version": "2.2.0",
         "description": "Real-time crypto assistant with live TGX Finance WebSocket data",
         "protocol": "TGX Finance WebSocket API v1",
-        "endpoints": {
+        "frontend_endpoints": {
+            "/api/chat": "Create new chat (POST with {user_input: string})",
+            "/api/chat/{chat_id}/stream": "Stream chat response (POST with {user_input: string})",
+            "/api/chat/{chat_id}": "Get chat session (GET)",
+            "/api/chats": "List all chats (GET)",
+            "/api/chat/{chat_id}": "Delete chat (DELETE)"
+        },
+        "legacy_endpoints": {
             "/": "API documentation",
-            "/health": "Health check and service status",
+            "/health": "Health check and service status", 
             "/market-data": "Live market data from TGX Finance",
             "/ask?user_input=<question>": "Ask crypto questions (streaming)",
-            "/api/chat": "Main chat endpoint (POST with JSON)",
+            "/chat": "Legacy chat endpoint (POST with JSON)",
             "/subscribe": "Manual subscription to contract feeds"
         },
         "websocket_status": ws_manager.connected if ws_manager else False,
         "authenticated": ws_manager._authenticated if ws_manager else False,
+        "active_chats": len(chat_sessions),
         "supported_topics": [
             "market.contract.switch",
             "contracts.market", 
@@ -967,6 +1117,7 @@ if __name__ == "__main__":
 • Authentication: {'Enabled' if config.get('token') and config.get('secret') else 'Disabled (public feeds only)'}
 • Heartbeat interval: {config['heartbeat_interval']}s
 • Port: {port}
+• Frontend Compatible: ✅ (POST /api/chat, POST /api/chat/{{id}}/stream)
         """)
 
         uvicorn.run(
