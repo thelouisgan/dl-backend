@@ -3,13 +3,25 @@ Real-time AI chatbot streaming interface using FastAPI backend with LangGraph to
 
 [![wakatime](https://wakatime.com/badge/user/83ae0aa5-9522-4183-a8b6-5598421c5b4f/project/f0dd206c-2f46-4b1b-86d9-896c7c69c004.svg)](https://wakatime.com/badge/user/83ae0aa5-9522-4183-a8b6-5598421c5b4f/project/f0dd206c-2f46-4b1b-86d9-896c7c69c004)
 
+Made by @thelouisgan and @Crispy2cookies
+
+![Chat Bot](https://github.com/user-attachments/assets/6c3f7d8e-cbff-4a70-80f6-6941719c72f1)
+
+> [!NOTE]
+> All tools have been successfully migrated to use MCP tools with a master MCP Server (original LangGraph has been deprecated)
+
 ## Integration with live market data APIs as a LangGraph tool
-Currently using ccxt library w/ Binance for price and ticker info
+Now using live ticker data from QuBit Finance WebSocket API
+```wss://api.tgx.finance/v1/ws/```
 
-// TODO:
-Will integrate with QuBit Finance WebSocket API
+## Interactive real chart data from local Jesse.Trade database
+<img width="2685" height="819" alt="image" src="https://github.com/user-attachments/assets/9a02c49e-9a34-4e6f-802c-382ddddb9a0f" />
 
-## Integration with Jesse.Trade db as a LangGraph tool
+## QuBit Trading API
+- Can execute limit trades for BTC and ETH
+- Pull current account data on orders and trades
+
+## Integration with Jesse.Trade db as a MCP tool
 ### Retrieving historical analysis data from local PostgreSQL database using Docker containers
 ### Data range:
 |BTC-USDT|ETH-USDT|
