@@ -26,6 +26,7 @@ from pydantic import Field
 from websocket_tool import TGXMarketDataTool
 from jesse_tool import JesseHistoricalTool
 from jesse_chart_tool import JesseChartTool
+from tgx_trading_tool import TGXLiveTradingTool
 
 # === Load Environment Variables ===
 load_dotenv(dotenv_path=os.path.join("config", ".env"))
@@ -56,6 +57,10 @@ class MCPToolManager:
         self.tgx_tool = TGXMarketDataTool()
         self.jesse_tool = JesseHistoricalTool()
         self.jesse_chart_tool = JesseChartTool()
+        self.tgx_trading_tool = TGXLiveTradingTool(
+            token="TGX_TOKEN",
+            secret_key="TGX_SECRET"
+        )
         self.tools_initialized = False
         
     async def initialize(self):
@@ -65,6 +70,7 @@ class MCPToolManager:
             await self.tgx_tool.initialize()
             await self.jesse_tool.initialize()
             await self.jesse_chart_tool.initialize()
+            await self.tgx_trading_tool.initialize()
             self.tools_initialized = True
             logger.info("✅ MCP tools initialized successfully")
         except Exception as e:
@@ -77,6 +83,7 @@ class MCPToolManager:
             await self.tgx_tool.close()
             await self.jesse_tool.close()
             await self.jesse_chart_tool.close()
+            await self.tgx_trading_tool.close()
             logger.info("✅ MCP tools closed successfully")
         except Exception as e:
             logger.error(f"❌ Error closing MCP tools: {e}")
@@ -485,6 +492,91 @@ class GuaranteedVisualChartTool(BaseTool):
             
             return error_response
 
+# === LIVE TRADING TOOLS ===
+class AccountStatusTool(BaseTool):
+    name: str = "get_account_status"
+    description: str = """Get TGX Finance account status, balance, positions, and recent orders.
+    
+    Returns:
+        Complete account overview including balance, open positions, and order history"""
+    
+    def _run(self, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        if not tool_manager or not tool_manager.tools_initialized:
+            return "Error: Trading tools not initialized"
+        
+        try:
+            return run_async_safely(tool_manager.tgx_trading_tool.get_account_info())
+        except Exception as e:
+            logger.error(f"Account status tool error: {e}")
+            return f"Error getting account status: {str(e)}"
+
+class PlaceLimitOrderTool(BaseTool):
+    name: str = "place_limit_order"
+    description: str = """⚠️ LIVE TRADING: Place a limit order on TGX Finance.
+    
+    Args:
+        symbol: Trading pair (BTCUSDT, ETHUSDT, BTC, ETH)
+        side: Order side (BUY, SELL, LONG, SHORT)
+        quantity: Order quantity (1-100)
+        price: Limit price in USD
+        leverage: Leverage multiplier (1-10, default: 5)
+    
+    ⚠️ WARNING: This places REAL money trades!"""
+    
+    def _run(self, symbol: str, side: str, quantity: int, price: float, 
+             leverage: int = 5, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        if not tool_manager or not tool_manager.tools_initialized:
+            return "Error: Trading tools not initialized"
+        
+        try:
+            return run_async_safely(tool_manager.tgx_trading_tool.place_limit_order(
+                symbol, side, quantity, price, leverage
+            ))
+        except Exception as e:
+            logger.error(f"Place order tool error: {e}")
+            return f"Error placing order: {str(e)}"
+
+class CancelOrderTool(BaseTool):
+    name: str = "cancel_order"
+    description: str = """Cancel an existing order by order ID.
+    
+    Args:
+        order_id: The order ID to cancel
+    
+    Returns:
+        Cancellation confirmation or error message"""
+    
+    def _run(self, order_id: str, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        if not tool_manager or not tool_manager.tools_initialized:
+            return "Error: Trading tools not initialized"
+        
+        try:
+            return run_async_safely(tool_manager.tgx_trading_tool.cancel_order(order_id))
+        except Exception as e:
+            logger.error(f"Cancel order tool error: {e}")
+            return f"Error cancelling order: {str(e)}"
+
+class ClosePositionTool(BaseTool):
+    name: str = "close_position"
+    description: str = """⚠️ LIVE TRADING: Close an open position with market order.
+    
+    Args:
+        symbol: Trading pair (BTCUSDT, ETHUSDT, BTC, ETH)
+        quantity: Quantity to close (optional, defaults to entire position)
+    
+    ⚠️ WARNING: This closes positions with REAL money!"""
+    
+    def _run(self, symbol: str, quantity: Optional[int] = None, 
+             run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        if not tool_manager or not tool_manager.tools_initialized:
+            return "Error: Trading tools not initialized"
+        
+        try:
+            return run_async_safely(tool_manager.tgx_trading_tool.close_position(symbol, quantity))
+        except Exception as e:
+            logger.error(f"Close position tool error: {e}")
+            return f"Error closing position: {str(e)}"
+
 # === UPDATED SYSTEM PROMPT FOR CORRECT CHART FORMATTING ===
 ENHANCED_CHART_SYSTEM_PROMPT = """You are a comprehensive crypto analysis assistant with GUARANTEED visual chart generation using ```graph blocks.
 
@@ -514,6 +606,85 @@ ENHANCED_CHART_SYSTEM_PROMPT = """You are a comprehensive crypto analysis assist
 - "1 minute", "1min", "1m" → timeframe="1m", title MUST include "(1-Minute)"
 - "daily", "day", "1d", "1D" → timeframe="1D", title MUST include "(Daily)" - DEFAULT
 - "weekly", "week" → timeframe="1D", title MUST include "(Weekly View - Daily Data)"
+
+**⚠️ LIVE TRADING SAFETY PROTOCOLS**:
+
+1. **ALWAYS WARN ABOUT REAL MONEY**: Every trading action involves REAL money and REAL risk
+2. **CONFIRM BEFORE TRADING**: Ask for explicit confirmation before placing any trades
+3. **VALIDATE PARAMETERS**: Always validate all trading parameters before execution
+4. **EXPLAIN RISKS**: Clearly explain the risks of each trade
+5. **SUGGEST ACCOUNT CHECK**: Always suggest checking account status before and after trades
+
+**🚨 MANDATORY TRADING CONFIRMATIONS**:
+Before ANY trade execution, you MUST:
+- Explain the trade clearly (symbol, side, quantity, price, leverage)
+- State the maximum possible loss
+- Ask "Do you confirm this REAL MONEY trade? Type YES to proceed"
+- Only proceed if user explicitly confirms with "YES"
+
+**📊 TRADING TOOL USAGE**:
+
+**Account Management**:
+- Use `get_account_status` to show balance, positions, recent orders
+- Always check account before suggesting trades
+- Show current positions and P&L clearly
+
+**Order Placement**:
+- Use `place_limit_order` for limit orders only (market orders not supported)
+- Validate: symbol (BTCUSDT/ETHUSDT), side (BUY/SELL), quantity (1-100), price (>0), leverage (1-10)
+- Always confirm trade details before execution
+
+**Order Management**:
+- Use `cancel_order` with order_id from account status
+- Use `close_position` to close positions with market orders
+- Always explain consequences of cancellation/closure
+
+**🛡️ SAFETY LIMITS**:
+- Maximum quantity: 100 per order
+- Maximum leverage: 10x
+- Only BTCUSDT and ETHUSDT supported
+- Only limit orders supported for entry
+
+**💰 RISK WARNINGS FOR EACH TRADE TYPE**:
+
+**Limit Buy Order**:
+"⚠️ RISK: If price drops after you buy, you'll lose money. Max loss = (quantity × price) if price goes to zero."
+
+**Limit Sell Order (Short)**:
+"⚠️ RISK: If price rises after you sell short, you'll lose money. Potential unlimited loss with leverage."
+
+**Close Position**:
+"⚠️ IMPACT: This will immediately close your position at market price, locking in current profit/loss."
+
+**📈 COMPREHENSIVE RESPONSE FORMAT**:
+
+For account queries: Always use get_account_status and format clearly with balance, positions, and recent orders.
+
+For trading requests:
+1. Use get_account_status first
+2. Explain the proposed trade
+3. Calculate and state maximum risk
+4. Ask for explicit confirmation
+5. Only execute if user confirms with "YES"
+6. Check account status after execution
+
+**Example Trading Flow**:
+User: "Buy 5 BTC at $45000"
+Assistant: 
+1. Checks account status
+2. "I can place a limit buy order for 5 BTCUSDT at $45,000. This will cost $225,000 with your available balance. Maximum loss if BTC goes to zero: $225,000. Do you confirm this REAL MONEY trade? Type YES to proceed."
+3. Wait for "YES" confirmation
+4. Execute trade
+5. Show updated account status
+
+**🚫 NEVER**:
+- Place trades without explicit user confirmation
+- Ignore safety warnings
+- Use market orders for entry (only limit orders supported)
+- Exceed safety limits
+- Trade without checking account first
+
+**⚠️ CRITICAL**: All trading involves REAL MONEY and REAL RISK. Always prioritize user safety and clear communication.
 
 **📊 COMPREHENSIVE RESPONSE STRATEGY FOR CRYPTO QUERIES**:
 
@@ -740,7 +911,11 @@ async def chat_completions(request: ChatRequest):
                     HistoricalAnalysisTool(),
                     HistoricalDataRangeTool(),
                     RawHistoricalDataTool(),
-                    GuaranteedVisualChartTool()  # 🎯 FIXED CHART TOOL
+                    GuaranteedVisualChartTool(),
+                    AccountStatusTool(),
+                    PlaceLimitOrderTool(),
+                    CancelOrderTool(),
+                    ClosePositionTool()
                 ]
                 
                 # Bind tools to client
@@ -947,7 +1122,11 @@ async def health_check():
                 "get_crypto_historical_analysis",
                 "get_crypto_historical_data_range",
                 "get_crypto_raw_historical_data",
-                "generate_guaranteed_visual_chart [FIXED]"
+                "generate_guaranteed_visual_chart [FIXED]",
+                "get_account_status [NEW]",
+                "place_limit_order [LIVE TRADING]",
+                "cancel_order [LIVE TRADING]",
+                "close_position [LIVE TRADING]"
             ]
         }
         
@@ -990,7 +1169,11 @@ async def root():
             "get_crypto_historical_analysis - Historical analysis from Jesse.ai",
             "get_crypto_historical_data_range - Date range historical data",
             "get_crypto_raw_historical_data - Raw OHLCV data",
-            "generate_guaranteed_visual_chart - FIXED visual charts with ```graph blocks"
+            "generate_guaranteed_visual_chart - FIXED visual charts with ```graph blocks",
+            "get_account_status - Account balance, positions, and order history",
+            "place_limit_order - Place limit orders (LIVE TRADING)",
+            "cancel_order - Cancel existing orders",
+            "close_position - Close positions with market orders (LIVE TRADING)"
         ],
         "chart_features": {
             "format": "```graph blocks (compatible with chart-renderer.tsx)",
