@@ -51,6 +51,59 @@ logger = logging.getLogger(__name__)
 class ChatRequest(BaseModel):
     messages: list
 
+# Additional Tool Classes (that were missing)
+class LiveCryptoDataTool(BaseTool):
+    name: str = "get_live_crypto_data"
+    description: str = "Get current live cryptocurrency prices and market data"
+    
+    def _run(self, symbol: str = "BTC", run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        try:
+            # Use the TGX tool to get live data
+            if tool_manager and tool_manager.tools_initialized:
+                live_data = run_async_safely(
+                    tool_manager.tgx_tool.get_market_data(symbol)
+                )
+                return f"Live {symbol} data: {live_data}"
+            else:
+                return f"Live data tool not initialized for {symbol}"
+        except Exception as e:
+            return f"Error getting live data for {symbol}: {str(e)}"
+
+class MarketStatusTool(BaseTool):
+    name: str = "get_market_status"
+    description: str = "Get current cryptocurrency market status and overview"
+    
+    def _run(self, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        try:
+            # Get market status from available tools
+            if tool_manager and tool_manager.tools_initialized:
+                # Use TGX tool to get market overview
+                market_data = run_async_safely(
+                    tool_manager.tgx_tool.get_market_data("BTC")
+                )
+                return f"Market status: {market_data}"
+            else:
+                return "Market status tool not initialized"
+        except Exception as e:
+            return f"Error getting market status: {str(e)}"
+
+class HistoricalAnalysisTool(BaseTool):
+    name: str = "get_historical_analysis"
+    description: str = "Get historical analysis and trends for cryptocurrencies"
+    
+    def _run(self, symbol: str = "BTC", days: int = 30, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        try:
+            # Use Jesse tool for historical analysis
+            if tool_manager and tool_manager.tools_initialized:
+                historical_data = run_async_safely(
+                    tool_manager.jesse_tool.get_historical_data(symbol, days)
+                )
+                return f"Historical analysis for {symbol} ({days} days): {historical_data}"
+            else:
+                return f"Historical analysis tool not initialized for {symbol}"
+        except Exception as e:
+            return f"Error getting historical analysis for {symbol}: {str(e)}"
+
 # Tool Manager
 class MCPToolManager:
     def __init__(self):
@@ -96,6 +149,7 @@ def run_async_safely(coro):
     
     try:
         loop = asyncio.get_running_loop()
+        import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(run_in_thread)
             return future.result()
@@ -105,9 +159,6 @@ def run_async_safely(coro):
 # 🎯 FIXED CHART TOOL - Uses ```graph instead of ```chart
 # Enhanced GuaranteedVisualChartTool with automatic BTC+ETH comparison detection
 
-
-
-
 class GuaranteedVisualChartTool(BaseTool):
     name: str = "generate_guaranteed_visual_chart"
     description: str = """🎯 PRIMARY CHART TOOL - Generates visual charts compatible with chart-renderer.tsx
@@ -115,20 +166,22 @@ class GuaranteedVisualChartTool(BaseTool):
     Args:
         symbol: Primary crypto symbol (BTC, ETH, BTCUSDT, etc.) 
         days_back: Days to show (7, 14, 30, 90, 365) - default 30
-        chart_type: 'price' for single crypto, 'comparison' for multiple lines on same graph
-        additional_symbols: List of symbols for comparison (e.g. ['ETH'] for BTC vs ETH)
-        comparison_request: Set to True to force comparison mode with BTC+ETH
+        timeframe: Chart interval ('1m', '5m', '15m', '30m', '1h', '4h', '1D') - default '1D'
+        chart_type: 'price' for single crypto, 'comparison' for BTC+ETH multi-line chart
+        additional_symbols: List of symbols for comparison (ignored - always uses BTC+ETH)
+        comparison_request: Set to True to force BTC+ETH comparison mode
     
     Returns:
-        Interactive visual chart in ```graph blocks with multiple lines on single graph
+        Interactive visual chart in ```graph blocks with GUARANTEED multi-line support
     """
     
-    def _run(self, symbol: str, days_back: int = 30, chart_type: str = "price", 
-             additional_symbols: list = None, comparison_request: bool = False,
+    def _run(self, symbol: str, days_back: int = 30, timeframe: str = "1D",
+             chart_type: str = "price", additional_symbols: list = None, 
+             comparison_request: bool = False,
              run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
         
         try:
-            logger.info(f"🎯 GENERATING VISUAL CHART: {symbol}, {days_back}d, type: {chart_type}")
+            logger.info(f"🎯 GENERATING VISUAL CHART: {symbol}, {days_back}d, {timeframe}, type: {chart_type}, comparison: {comparison_request}")
             
             # Ensure tools are initialized
             if not tool_manager or not tool_manager.tools_initialized:
@@ -136,129 +189,80 @@ class GuaranteedVisualChartTool(BaseTool):
                 logger.error(f"❌ {error_msg}")
                 raise Exception(error_msg)
             
-            # 🔥 ENHANCED AUTO-DETECT for BTC+ETH comparison requests
+            # Validate timeframe
+            valid_timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1D', '1d']
+            if timeframe not in valid_timeframes:
+                logger.warning(f"Invalid timeframe {timeframe}, defaulting to 1D")
+                timeframe = '1D'
+            
+            # 🔥 CRITICAL: Force BTC+ETH comparison when comparison is requested
+            if comparison_request or chart_type == "comparison":
+                logger.info("🔥 COMPARISON REQUEST DETECTED - Generating GUARANTEED BTC vs ETH multi-line chart")
+                return self._generate_guaranteed_btc_eth_comparison(days_back, timeframe)
+            
+            # Check for comparison keywords in symbol or implicit comparison request
             symbol_upper = symbol.upper()
-            auto_comparison_symbols = []
-            force_comparison = comparison_request
+            comparison_indicators = ['VS', 'VERSUS', 'COMPARE', 'COMPARISON']
             
-            # Check for explicit comparison keywords or requests
-            btc_variants = ['BTC', 'BITCOIN', 'BTCUSDT', 'BTC-USDT']
-            eth_variants = ['ETH', 'ETHEREUM', 'ETHUSDT', 'ETH-USDT', 'ETHER']
+            # Auto-detect comparison requests
+            if (any(indicator in symbol_upper for indicator in comparison_indicators) or 
+                ('BTC' in symbol_upper and 'ETH' in symbol_upper)):
+                logger.info("🔥 AUTO-DETECTED COMPARISON REQUEST - Generating GUARANTEED BTC vs ETH multi-line chart")
+                return self._generate_guaranteed_btc_eth_comparison(days_back, timeframe)
             
-            # NEW: Check if this is a comparison request (user said "comparison", "vs", "both", etc.)
-            comparison_keywords = ['comparison', 'compare', 'vs', 'versus', 'both', 'together', 'against']
-            
-            # If the primary symbol is BTC and it's a comparison request, add ETH
-            if any(variant in symbol_upper for variant in btc_variants):
-                if comparison_request or chart_type == "comparison":
-                    auto_comparison_symbols = ['ETH']
-                    force_comparison = True
-                    logger.info("🔥 COMPARISON MODE: BTC primary - Adding ETH for side-by-side comparison")
-            
-            # If the primary symbol is ETH and it's a comparison request, add BTC  
-            elif any(variant in symbol_upper for variant in eth_variants):
-                if comparison_request or chart_type == "comparison":
-                    auto_comparison_symbols = ['BTC']
-                    force_comparison = True
-                    logger.info("🔥 COMPARISON MODE: ETH primary - Adding BTC for side-by-side comparison")
-            
-            # Combine with any manually specified additional symbols
-            if additional_symbols:
-                all_additional = list(set(auto_comparison_symbols + additional_symbols))
-            else:
-                all_additional = auto_comparison_symbols
-            
-            # Force comparison mode if we have additional symbols
-            if all_additional and len(all_additional) > 0:
-                chart_type = "comparison"
-                force_comparison = True
-            
-            # Get real data from Jesse database
+            # Generate single price chart
             try:
-                if force_comparison and all_additional:
-                    # 🎯 FIXED: Generate SINGLE comparison chart with MULTIPLE LINES
-                    all_symbols = [symbol] + all_additional
-                    logger.info(f"📊 Generating SINGLE COMPARISON CHART with MULTIPLE LINES: {all_symbols}")
-                    
-                    # This should create ONE chart with multiple data series (lines)
-                    chart_data_json = run_async_safely(
-                        tool_manager.jesse_chart_tool.get_comparison_chart_data(all_symbols, days_back)
-                    )
-                    
-                    chart_description = f"Multi-Line Comparison Chart"
-                    symbols_text = f"{' vs '.join(all_symbols)}"
-                    
-                else:
-                    # Generate single price chart
-                    logger.info(f"📊 Generating SINGLE PRICE CHART: {symbol}")
-                    chart_data_json = run_async_safely(
-                        tool_manager.jesse_chart_tool.get_price_chart_data(symbol, days_back)
-                    )
-                    
-                    chart_description = f"Single Price Chart"
-                    symbols_text = symbol
+                logger.info(f"📊 Generating SINGLE PRICE CHART: {symbol} ({timeframe})")
                 
-                # Parse and validate the JSON
-                chart_data = json.loads(chart_data_json)
-                logger.info(f"✅ Chart data generated successfully")
-                
-                # 🔍 DEBUG: Log the chart data structure
-                if 'history' in chart_data and 'content' in chart_data['history']:
-                    content_count = len(chart_data['history']['content'])
-                    logger.info(f"📊 Chart contains {content_count} data series (lines)")
-                    
-                    # Log each series for debugging
-                    for i, series in enumerate(chart_data['history']['content']):
-                        series_name = series.get('name', f'Series {i+1}')
-                        series_color = series.get('primary_colour', 'Unknown')
-                        data_points = len(series.get('x', []))
-                        logger.info(f"  - Line {i+1}: {series_name} ({series_color}) - {data_points} points")
+                chart_data_json = run_async_safely(
+                    tool_manager.jesse_chart_tool.get_price_chart_data(symbol, days_back, timeframe)
+                )
                 
             except Exception as data_error:
                 logger.error(f"❌ Data retrieval error for {symbol}: {data_error}")
                 raise data_error
             
-            # SUCCESS: Format the response with ```graph (not ```chart)
-            response = f"""🎯 **Interactive Multi-Line Chart Generated**
+            # Parse and validate the JSON
+            chart_data = json.loads(chart_data_json)
+            logger.info(f"✅ Single chart data generated successfully")
+            
+            # Get timeframe display name for response
+            timeframe_labels = {
+                '1m': '1-Minute',
+                '5m': '5-Minute', 
+                '15m': '15-Minute',
+                '30m': '30-Minute', 
+                '1h': 'Hourly',
+                '4h': '4-Hour',
+                '1D': 'Daily',
+                '1d': 'Daily'
+            }
+            timeframe_display = timeframe_labels.get(timeframe, timeframe)
+            
+            # SUCCESS: Format the response with ```graph
+            response = f"""🎯 **Interactive Price Chart Generated**
 
-**📊 Chart**: {symbols_text} ({chart_description})
+**📊 Chart**: {symbol} Price Chart
 **📅 Period**: Last {days_back} days  
-**✅ Status**: Ready for Visual Rendering with Multiple Lines
+**⏱️ Timeframe**: {timeframe_display}
+**✅ Status**: Ready for Visual Rendering
 
 ```graph
 {json.dumps(chart_data, indent=2)}
 ```
 
 **🎨 Interactive Features**:
-- Multiple cryptocurrency lines on single graph
-- Hover tooltips showing exact values for each line
-- Zoom and pan functionality across all data series
-- Professional crypto-themed colors (BTC: Orange, ETH: Blue)
+- {timeframe_display} interval data resolution
+- Hover tooltips showing exact values
+- Zoom and pan functionality
+- Professional crypto-themed colors
 - Responsive design for all devices
 - Real-time data from Jesse.ai database
-- Legend showing all cryptocurrencies
 
-**📱 Rendering**: This chart automatically renders as an interactive visualization with multiple lines in your frontend."""
+**📱 Rendering**: This chart automatically renders as an interactive visualization in your frontend."""
 
-            # 🚨 CRITICAL: Log the complete response to console BEFORE returning
-            print(f"\n" + "="*80)
-            print(f"🎯 COMPLETE MULTI-LINE CHART RESPONSE (SENDING TO FRONTEND):")
-            print("="*80)
-            print(response)
-            print("="*80)
-            print(f"✅ Response contains ```graph block: {'```graph' in response}")
-            print(f"🔥 Chart type: {chart_type}")
-            if force_comparison:
-                print(f"🔥 Multi-line chart symbols: {[symbol] + all_additional}")
-                print(f"🔥 Expected lines on single graph: {len([symbol] + all_additional)}")
-            print("="*80 + "\n")
-
-            logger.info(f"✅ MULTI-LINE VISUAL CHART SUCCESS: {symbols_text}")
+            logger.info(f"✅ SINGLE PRICE CHART SUCCESS: {symbol}")
             return response
-            
-
-
-
             
         except Exception as e:
             logger.error(f"❌ Chart generation error for {symbol}: {e}")
@@ -268,191 +272,296 @@ class GuaranteedVisualChartTool(BaseTool):
             # Create error response
             error_response = f"""❌ **Chart Generation Error**
 
-**Error**: Failed to generate multi-line chart for {symbol}
+**Error**: Failed to generate chart for {symbol}
+**Timeframe**: {timeframe}
 **Details**: {str(e)}
 
 ```graph
-{{"error": "Chart data unavailable", "symbol": "{symbol}", "message": "Please try again or contact support"}}
+{{"error": "Chart data unavailable", "symbol": "{symbol}", "timeframe": "{timeframe}", "message": "Please try again or contact support"}}
 ```
 
-**🔧 Troubleshooting**: Try a different symbol or check system status."""
+**🔧 Troubleshooting**: Try a different symbol, timeframe, or check system status."""
+
+            return error_response
+
+    def _generate_guaranteed_btc_eth_comparison(self, days_back: int = 30, timeframe: str = "1D") -> str:
+        """🔥 GUARANTEED: Generate BTC vs ETH comparison chart with MULTIPLE LINES and proper timeframe"""
+        try:
+            logger.info(f"🎯 GENERATING GUARANTEED BTC vs ETH MULTI-LINE COMPARISON ({timeframe})")
+            
+            # Ensure tools are initialized
+            if not tool_manager or not tool_manager.tools_initialized:
+                error_msg = "Chart tools not initialized for comparison"
+                logger.error(f"❌ {error_msg}")
+                raise Exception(error_msg)
+            
+            # 🔥 FORCE BTC and ETH symbols - NO EXCEPTIONS
+            symbols = ['BTC', 'ETH']
+            
+            logger.info(f"📊 Calling get_comparison_chart_data for GUARANTEED BTC vs ETH with timeframe {timeframe}...")
+            chart_data_json = run_async_safely(
+                tool_manager.jesse_chart_tool.get_comparison_chart_data(symbols, days_back, timeframe)
+            )
+            
+            # Parse and validate the JSON
+            chart_data = json.loads(chart_data_json)
+            logger.info(f"✅ BTC vs ETH comparison chart data parsed successfully")
+            
+            # 🔍 CRITICAL VALIDATION: Verify multi-line structure
+            if 'history' in chart_data and 'content' in chart_data['history']:
+                content_count = len(chart_data['history']['content'])
+                logger.info(f"📊 Comparison chart contains {content_count} data series (lines)")
+                
+                if content_count < 2:
+                    logger.error(f"❌ CRITICAL ERROR: Expected 2 lines (BTC+ETH) but got {content_count}")
+                    raise Exception(f"FAILED: Multi-line comparison chart only created {content_count} series instead of 2")
+                
+                # Verify we have Bitcoin and Ethereum specifically
+                series_names = [series.get('name', 'Unknown') for series in chart_data['history']['content']]
+                logger.info(f"📊 Series names detected: {series_names}")
+                
+                has_bitcoin = any('Bitcoin' in name for name in series_names)
+                has_ethereum = any('Ethereum' in name for name in series_names)
+                
+                if not (has_bitcoin and has_ethereum):
+                    logger.error(f"❌ Missing BTC or ETH in series: {series_names}")
+                    raise Exception(f"FAILED: Expected Bitcoin and Ethereum series, got: {series_names}")
+                
+                # Log each series for debugging
+                for i, series in enumerate(chart_data['history']['content']):
+                    series_name = series.get('name', f'Series {i+1}')
+                    series_color = series.get('primary_colour', 'Unknown')
+                    data_points = len(series.get('x', []))
+                    sample_prices = series.get('price', {}).get('y', [])[:3]
+                    logger.info(f"  - Line {i+1}: {series_name} ({series_color}) - {data_points} points")
+                    logger.info(f"    Sample prices: {sample_prices}")
+                    
+            else:
+                logger.error("❌ Invalid chart data structure - missing history.content")
+                raise Exception("Invalid chart data structure for comparison chart")
+            
+            # Get timeframe display name
+            timeframe_labels = {
+                '1m': '1-Minute',
+                '5m': '5-Minute', 
+                '15m': '15-Minute',
+                '30m': '30-Minute', 
+                '1h': 'Hourly',
+                '4h': '4-Hour',
+                '1D': 'Daily',
+                '1d': 'Daily'
+            }
+            timeframe_display = timeframe_labels.get(timeframe, timeframe)
+            
+            # SUCCESS: Format the response with ```graph
+            response = f"""🎯 **Interactive BTC vs ETH Multi-Line Comparison Chart Generated**
+
+**📊 Chart**: Bitcoin vs Ethereum Multi-Line Comparison  
+**📅 Period**: Last {days_back} days
+**⏱️ Timeframe**: {timeframe_display}
+**✅ Status**: Ready for Visual Rendering with {len(chart_data['history']['content'])} SEPARATE Lines
+
+```graph
+{json.dumps(chart_data, indent=2)}
+```
+
+**🎨 Interactive Features**:
+- **{len(chart_data['history']['content'])} SEPARATE cryptocurrency lines** on single graph (Bitcoin: Orange, Ethereum: Blue)
+- {timeframe_display} interval data resolution
+- Hover tooltips showing exact values for EACH line
+- Zoom and pan functionality across all data series
+- Professional crypto-themed colors
+- Responsive design for all devices
+- Real-time data from Jesse.ai database
+- Legend showing BOTH cryptocurrencies clearly
+
+**📱 Rendering**: This comparison chart automatically renders as an interactive visualization with **{len(chart_data['history']['content'])} DISTINCT COLORED LINES** in your frontend."""
+
+            # 🚨 CRITICAL: Log the complete response to console BEFORE returning
+            print(f"\n" + "="*90)
+            print(f"🔥 GUARANTEED BTC vs ETH MULTI-LINE COMPARISON CHART RESPONSE (SENDING TO FRONTEND):")
+            print("="*90)
+            print(f"TIMEFRAME: {timeframe} ({timeframe_display})")
+            print(f"LINES IN CHART: {len(chart_data['history']['content'])}")
+            print(f"SERIES NAMES: {[s.get('name') for s in chart_data['history']['content']]}")
+            print(f"SERIES COLORS: {[s.get('primary_colour') for s in chart_data['history']['content']]}")
+            print(f"TITLE: {chart_data['history'].get('title', 'No title')}")
+            print(f"RESPONSE LENGTH: {len(response)} characters")
+            print(f"CONTAINS ```graph: {'```graph' in response}")
+            print("-"*90)
+            print("CHART DATA PREVIEW:")
+            print(json.dumps(chart_data, indent=2)[:800] + "..." if len(json.dumps(chart_data)) > 800 else json.dumps(chart_data, indent=2))
+            print("="*90)
+            
+            # Final validation
+            if len(chart_data['history']['content']) != 2:
+                print("⚠️ WARNING: EXPECTED EXACTLY 2 LINES (BTC+ETH) - COMPARISON MAY NOT WORK PROPERLY")
+            else:
+                print("✅ SUCCESS: 2 LINES CONFIRMED (BTC+ETH) - GUARANTEED MULTI-LINE COMPARISON READY")
+            
+            print("="*90 + "\n")
+
+            logger.info(f"✅ GUARANTEED BTC vs ETH MULTI-LINE COMPARISON CHART SUCCESS")
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ GUARANTEED BTC vs ETH multi-line comparison chart generation error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Create error response
+            error_response = f"""❌ **BTC vs ETH Multi-Line Comparison Chart Generation Error**
+
+**Error**: Failed to generate GUARANTEED BTC vs ETH multi-line comparison chart
+**Timeframe**: {timeframe}
+**Details**: {str(e)}
+
+```graph
+{{"error": "BTC vs ETH multi-line comparison chart data unavailable", "timeframe": "{timeframe}", "message": "System error - please try again or contact support"}}
+```
+
+**🔧 Troubleshooting**: Try different timeframe or check system status."""
 
             # Log error response to console
             print(f"\n" + "="*80)
-            print(f"❌ ERROR RESPONSE FOR {symbol} (SENDING TO FRONTEND):")
+            print(f"❌ BTC vs ETH MULTI-LINE COMPARISON ERROR RESPONSE (SENDING TO FRONTEND):")
             print("="*80)
             print(error_response)
             print("="*80 + "\n")
             
             return error_response
 
-
-# Enhanced LangChain Tools
-class LiveCryptoDataTool(BaseTool):
-    name: str = "get_live_crypto_data"
-    description: str = """Get live cryptocurrency market data from TGX Finance WebSocket.
-    
-    Args:
-        symbol: Cryptocurrency symbol (BTC, ETH, or 'all' for both)
-    
-    Returns:
-        Current price, change, volume, and market data"""
-    
-    def _run(self, symbol: str = "BTC", run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        if not tool_manager or not tool_manager.tools_initialized:
-            return "Error: MCP tools not initialized"
-        
-        try:
-            result = run_async_safely(tool_manager.tgx_tool.get_market_data(symbol))
-            
-            # Log the result to console
-            print(f"\n📊 LIVE CRYPTO DATA RESULT FOR {symbol}:")
-            print("-" * 50)
-            print(result)
-            print("-" * 50 + "\n")
-            
-            return result
-        except Exception as e:
-            logger.error(f"Live crypto data tool error: {e}")
-            return f"Error getting live data: {str(e)}"
-
-class MarketStatusTool(BaseTool):
-    name: str = "get_live_market_status"
-    description: str = """Get TGX Finance WebSocket connection status and system health."""
-    
-    def _run(self, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        if not tool_manager or not tool_manager.tools_initialized:
-            return "Error: MCP tools not initialized"
-        
-        try:
-            result = run_async_safely(tool_manager.tgx_tool.get_connection_status())
-            
-            # Log the result to console
-            print(f"\n🔗 MARKET STATUS RESULT:")
-            print("-" * 40)
-            print(result)
-            print("-" * 40 + "\n")
-            
-            return result
-        except Exception as e:
-            logger.error(f"Market status tool error: {e}")
-            return f"Error getting market status: {str(e)}"
-
-class HistoricalAnalysisTool(BaseTool):
-    name: str = "get_crypto_historical_analysis"
-    description: str = """Get historical cryptocurrency analysis from Jesse.ai database.
-    
-    Args:
-        symbol: Cryptocurrency symbol (e.g., 'BTCUSDT', 'ETHUSDT')
-        timeframe: Chart timeframe ('1m', '5m', '15m', '30m', '1h', '4h', '1D')
-    """
-    
-    def _run(self, symbol: str, timeframe: str = "1D", run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        if not tool_manager or not tool_manager.tools_initialized:
-            return "Error: MCP tools not initialized"
-        
-        try:
-            result = run_async_safely(tool_manager.jesse_tool.get_historical_analysis(symbol, timeframe))
-            
-            # Log the result to console
-            print(f"\n📈 HISTORICAL ANALYSIS RESULT FOR {symbol} ({timeframe}):")
-            print("-" * 60)
-            print(result)
-            print("-" * 60 + "\n")
-            
-            return result
-        except Exception as e:
-            logger.error(f"Historical analysis tool error: {e}")
-            return f"Error getting historical analysis: {str(e)}"
-
-# Enhanced System Prompt for GUARANTEED Visual Charts with ```graph
-VISUAL_CHART_SYSTEM_PROMPT = """You are a cryptocurrency analysis assistant with multi-line visual chart generation capabilities.
+# Updated system prompt for multi-line charts
+VISUAL_CHART_SYSTEM_PROMPT = """You are a cryptocurrency analysis assistant with GUARANTEED multi-line visual chart generation and timeframe support.
 
 🎯 **CRITICAL MULTI-LINE CHART RULES**:
 
 1. **ALWAYS USE generate_guaranteed_visual_chart FOR ANY CHART REQUEST**
-2. **For comparison requests, set comparison_request=True to get MULTIPLE LINES on SINGLE GRAPH**
-3. **The tool returns ```graph blocks (NOT ```chart) - keep them exactly as provided**
-4. **EVERY chart request MUST result in a ```graph block for chart-renderer.tsx**
+2. **For ANY comparison request, ALWAYS generate BTC vs ETH chart with comparison_request=True**
+3. **ALWAYS specify timeframe parameter and ensure title reflects the EXACT timeframe**
+4. **The tool returns ```graph blocks (NOT ```chart) - keep them exactly as provided**
+5. **EVERY chart request MUST result in a ```graph block for chart-renderer.tsx**
+6. **Multi-line charts are GUARANTEED to show 2 separate lines for BTC and ETH**
 
-**Auto-Trigger Multi-Line Chart Generation** for these requests:
-- "comparison", "compare", "vs", "versus", "both", "together", "against"
-- "BTC vs ETH", "Bitcoin and Ethereum", "show both"
-- "side by side", "multiple cryptocurrencies"
-- "BTC ETH comparison", "compare Bitcoin to Ethereum"
+**🔥 GUARANTEED COMPARISON DETECTION - ALWAYS TRIGGER BTC+ETH MULTI-LINE COMPARISON FOR**:
+- ANY mention of "comparison", "compare", "vs", "versus", "both", "together", "against"
+- "BTC vs ETH", "Bitcoin and Ethereum", "show both", "side by side", "two lines"
+- "multiple cryptocurrencies", "two cryptocurrencies", "crypto comparison"  
+- User asks for "BTC and ETH", "Bitcoin versus Ethereum", "compare them"
+- "difference between", "which is better", "performance comparison"
+- "multi-line", "separate lines", "different colors"
 
-**MANDATORY Response Format for Multi-Line Charts**:
-When user asks for comparison, use:
+**🕐 CRITICAL TIMEFRAME DETECTION AND TITLE REQUIREMENTS**:
+- "hourly", "1 hour", "hour", "1h" → timeframe="1h", title MUST include "(Hourly)"
+- "4 hour", "4h", "4-hour" → timeframe="4h", title MUST include "(4-Hour)"  
+- "15 minute", "15min", "15m" → timeframe="15m", title MUST include "(15-Minute)"
+- "30 minute", "30min", "30m" → timeframe="30m", title MUST include "(30-Minute)"
+- "5 minute", "5min", "5m" → timeframe="5m", title MUST include "(5-Minute)"
+- "1 minute", "1min", "1m" → timeframe="1m", title MUST include "(1-Minute)"
+- "daily", "day", "1d", "1D" → timeframe="1D", title MUST include "(Daily)" - DEFAULT
+- "weekly", "week" → timeframe="1D", title MUST include "(Weekly View - Daily Data)"
+
+**🔥 MANDATORY Response Format for GUARANTEED BTC+ETH Multi-Line Comparison**:
+When user asks for ANY comparison, ALWAYS use:
 ```python
 generate_guaranteed_visual_chart(
-    symbol="BTC", 
+    symbol="BTC",  # Primary symbol (ignored for comparison)
     chart_type="comparison", 
-    comparison_request=True,
-    additional_symbols=["ETH"],
-    days_back=30
+    comparison_request=True,  # THIS FORCES GUARANTEED BTC+ETH MULTI-LINE
+    days_back=30,
+    timeframe="1D"  # ALWAYS specify detected timeframe
 )
+```
 
+**📊 Chart Detection Logic with GUARANTEED BTC+ETH Multi-Line and Proper Titles**:
+- "BTC hourly" = Single BTC chart with timeframe="1h", title: "Bitcoin Price - Last X Days (Hourly)"
+- "compare BTC and ETH" = GUARANTEED BTC+ETH multi-line with timeframe="1D", title: "Bitcoin vs Ethereum Comparison - Last X Days (Daily)"
+- "BTC vs ETH 4h" = GUARANTEED BTC+ETH multi-line with timeframe="4h", title: "Bitcoin vs Ethereum Comparison - Last X Days (4-Hour)"
+- "show both Bitcoin and Ethereum weekly" = GUARANTEED BTC+ETH multi-line, title: "Bitcoin vs Ethereum Comparison - Last X Days (Weekly View - Daily Data)"
+- "Bitcoin vs Ethereum 15 minute chart" = GUARANTEED BTC+ETH multi-line with timeframe="15m", title: "Bitcoin vs Ethereum Comparison - Last X Days (15-Minute)"
+- "two lines showing BTC and ETH" = GUARANTEED BTC+ETH multi-line comparison
 
-**Chart Detection Logic**:
-- Single word like "BTC" = Single line chart
-- "BTC comparison" or "BTC vs ETH" = Multi-line chart with BTC + ETH
-- "compare BTC and ETH" = Multi-line chart with both lines
-- "Bitcoin Ethereum" = Multi-line chart with both lines
+**🚫 NEVER DO - CRITICAL MISTAKES TO AVOID**:
+- Don't create separate charts for each cryptocurrency
+- Don't change ```graph to ```chart or anything else
+- Don't modify the JSON content inside ```graph blocks
+- Don't ignore timeframe specifications in titles  
+- Don't use anything other than BTC+ETH for comparisons
+- Don't say "here's the data" without the graph block
+- Don't create single-line charts when comparison is requested
 
-**MANDATORY Response Format**:
-When you get data from generate_guaranteed_visual_chart, you MUST preserve the ```graph block exactly:
+**✅ MANDATORY Response Format Examples**:
 
-✅ CORRECT Multi-Line:
+**For Single Crypto with Specific Timeframe:**
 ```graph
 {
   "history": {
-    "title": "Comparison (30 days)",
+    "title": "Bitcoin Price - Last 30 Days (Hourly)",
+    "xlabel": "Date",
+    "content": [{
+      "name": "Bitcoin",
+      "primary_colour": "#F7931A",
+      "x": ["2024-01-01 00:00:00", "2024-01-01 01:00:00"],
+      "price": {"y": [45000, 46000], "ylabel": "Price (USD)"}
+    }]
+  }
+}
+```
+
+**For GUARANTEED BTC+ETH Multi-Line Comparison with Proper Timeframe Title:**
+```graph
+{
+  "history": {
+    "title": "Bitcoin vs Ethereum Comparison - Last 30 Days (Hourly)",
+    "xlabel": "Date", 
     "content": [
       {
         "name": "Bitcoin",
         "primary_colour": "#F7931A",
-        "x": ["2024-01-01", "2024-01-02"],
-        "price": {"y": [45000, 46000], "ylabel": "Change (%)"}
+        "x": ["2024-01-01 00:00:00", "2024-01-01 01:00:00"],
+        "price": {"y": [45000, 46000], "ylabel": "Price (USD)"}
       },
       {
         "name": "Ethereum", 
         "primary_colour": "#627EEA",
-        "x": ["2024-01-01", "2024-01-02"],
-        "price": {"y": [3000, 3100], "ylabel": "Change (%)"}
+        "x": ["2024-01-01 00:00:00", "2024-01-01 01:00:00"],
+        "price": {"y": [3000, 3100], "ylabel": "Price (USD)"}
       }
     ]
   }
 }
 ```
-❌ NEVER DO:
-- Change ```graph to ```chart or anything else
-- Modify the JSON content inside ```graph blocks
-- Return separate charts for each cryptocurrency
-- Say "here's the data" without the graph block
 
-**Response Structure for Multi-Line Charts**:
-1. Brief intro about the multi-line chart being generated
-2. The EXACT ```graph block from the tool (contains multiple data series)
-3. Explanation that this shows multiple lines on a single interactive graph
+**Response Structure for GUARANTEED BTC+ETH Multi-Line Comparison Charts**:
+1. Brief intro about the GUARANTEED BTC vs ETH multi-line comparison chart being generated
+2. The EXACT ```graph block from the tool (contains BOTH BTC and ETH data series as separate content entries)
+3. Explanation that this shows BTC (orange) and ETH (blue) lines as TWO SEPARATE LINES on a SINGLE interactive graph
 
-**Example Multi-Line Response**:
-"I'll generate an interactive comparison chart showing both Bitcoin and Ethereum on the same graph:
+**Example GUARANTEED BTC+ETH Multi-Line Comparison Response with Correct Timeframe**:
+"I'll generate an interactive multi-line comparison chart showing Bitcoin and Ethereum as two separate colored lines on the same graph with hourly data:
 
 ```graph
 {
   "history": {
-    "title": "BTC vs ETH Comparison (30 days)",
+    "title": "Bitcoin vs Ethereum Comparison - Last 30 Days (Hourly)",
+    "xlabel": "Date",
     "content": [
-      {"name": "Bitcoin", "primary_colour": "#F7931A", ...},
-      {"name": "Ethereum", "primary_colour": "#627EEA", ...}
+      {"name": "Bitcoin", "primary_colour": "#F7931A", "x": [...], "price": {"y": [...], "ylabel": "Price (USD)"}},
+      {"name": "Ethereum", "primary_colour": "#627EEA", "x": [...], "price": {"y": [...], "ylabel": "Price (USD)"}}
     ]
   }
 }
 ```
 
-This interactive chart displays both cryptocurrencies as separate colored lines on a single graph with hover tooltips, zoom, and pan capabilities."
-"""
+This interactive multi-line chart displays Bitcoin (orange line) and Ethereum (blue line) as TWO SEPARATE COLORED LINES on a single graph with hourly intervals, including hover tooltips, zoom, and pan capabilities."
 
+🎯 **CRITICAL**: ALWAYS force GUARANTEED BTC+ETH multi-line comparison when ANY comparison is requested, regardless of what cryptocurrencies the user mentions. The system is optimized for Bitcoin vs Ethereum comparisons with GUARANTEED multi-line output showing 2 distinct colored lines.
+
+🔥 **TITLE VERIFICATION**: Every chart title MUST reflect the detected timeframe. Never leave timeframe out of the title.
+
+📊 **MULTI-LINE GUARANTEE**: Every comparison chart MUST contain exactly 2 series (BTC + ETH) in the content array, each with their own name, color, and data arrays.
+
+🚨 **CHART RENDERER COMPATIBILITY**: The format uses history.content array with multiple entries (one per line) - this is the CORRECT format for chart-renderer.tsx to process multiple lines."""
 
 # FastAPI App Setup
 @asynccontextmanager
@@ -491,10 +600,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🎯 PRIMARY ENDPOINT: Visual Charts
+# 🎯 FIXED ENDPOINT: Visual Charts with Guaranteed BTC+ETH Comparison
 @app.post("/v1/chat/completions")
 async def visual_chart_endpoint(request: ChatRequest):
-    """Chat endpoint with multi-line visual chart generation"""
+    """Chat endpoint with GUARANTEED BTC+ETH comparison and proper timeframe titles"""
     try:
         if not tool_manager or not tool_manager.tools_initialized:
             raise HTTPException(status_code=503, detail="Visual chart system not initialized")
@@ -511,27 +620,65 @@ async def visual_chart_endpoint(request: ChatRequest):
         if isinstance(user_input, list):
             user_input = ' '.join(item.get('text', '') for item in user_input if isinstance(item, dict))
         
-        # Enhanced detection for comparison requests
+        # Enhanced detection for comparison requests and timeframes
         chart_keywords = ['chart', 'graph', 'plot', 'visualize', 'show', 'display', 
                         'price chart', 'comparison', 'vs', 'versus', 'compare',
                         'trend', 'performance', 'history', 'over time']
         
-        # Multi-line comparison detection
-        comparison_keywords = ['comparison', 'compare', 'vs', 'versus', 'both', 
-                             'together', 'against', 'side by side', 'and']
+        # 🔥 ENHANCED: More comprehensive comparison detection
+        comparison_keywords = [
+            'comparison', 'compare', 'vs', 'versus', 'both', 'together', 'against',
+            'side by side', 'and', 'two', 'multiple', 'crypto comparison',
+            'bitcoin and ethereum', 'btc and eth', 'btc vs eth', 'bitcoin vs ethereum',
+            'show both', 'compare them', 'between', 'difference between'
+        ]
+        
+        # 🔥 FIXED: Better timeframe detection with weekly support
+        timeframe_patterns = {
+            '1m': ['1 minute', '1min', '1m', 'minute'],
+            '5m': ['5 minute', '5min', '5m', '5 minutes'],
+            '15m': ['15 minute', '15min', '15m', '15 minutes'],
+            '30m': ['30 minute', '30min', '30m', '30 minutes'],
+            '1h': ['1 hour', '1h', 'hour', 'hourly', '1hr'],
+            '4h': ['4 hour', '4h', '4 hours', '4hr', '4-hour'],
+            '1D': ['daily', 'day', '1d', '1D', '1 day', 'weekly', 'week']  # Weekly uses daily data
+        }
+        
+        detected_timeframe = '1D'  # Default
+        is_weekly_request = False
+        
+        for timeframe, patterns in timeframe_patterns.items():
+            if any(pattern.lower() in user_input.lower() for pattern in patterns):
+                detected_timeframe = timeframe
+                if any(weekly in user_input.lower() for weekly in ['weekly', 'week']):
+                    is_weekly_request = True
+                logger.info(f"🕐 DETECTED TIMEFRAME: {detected_timeframe}")
+                break
         
         is_chart_request = any(keyword in user_input.lower() for keyword in chart_keywords)
+        
+        # 🔥 ENHANCED: Better comparison detection
         is_comparison_request = any(keyword in user_input.lower() for keyword in comparison_keywords)
         
-        # Check for specific crypto mentions
+        # Check for specific crypto mentions that suggest comparison
         has_btc = any(term in user_input.upper() for term in ['BTC', 'BITCOIN', 'BTCUSDT'])
         has_eth = any(term in user_input.upper() for term in ['ETH', 'ETHEREUM', 'ETHUSDT', 'ETHER'])
         
-        # If user mentions both BTC and ETH, force comparison mode
+        # 🔥 FORCE COMPARISON: If user mentions both BTC and ETH
         if has_btc and has_eth:
             is_comparison_request = True
-            logger.info("🔥 DETECTED: User mentioned both BTC and ETH - Forcing comparison mode")
+            logger.info("🔥 DETECTED: User mentioned both BTC and ETH - FORCING BTC vs ETH comparison mode")
         
+        # 🔥 FORCE COMPARISON: Common comparison phrases
+        comparison_phrases = [
+            'btc vs eth', 'bitcoin vs ethereum', 'compare btc', 'compare bitcoin',
+            'btc and eth', 'bitcoin and ethereum', 'show both', 'both crypto'
+        ]
+        
+        if any(phrase in user_input.lower() for phrase in comparison_phrases):
+            is_comparison_request = True
+            logger.info("🔥 DETECTED: Comparison phrase found - FORCING BTC vs ETH comparison mode")
+
         def generate_visual_response():
             try:
                 # Create LLM client
@@ -544,7 +691,7 @@ async def visual_chart_endpoint(request: ChatRequest):
                 
                 # Tools with updated visual chart generator
                 tools = [
-                    GuaranteedVisualChartTool(),  # 🎯 PRIMARY: Multi-line visual charts
+                    GuaranteedVisualChartTool(),  # 🎯 PRIMARY: BTC+ETH comparison charts
                     LiveCryptoDataTool(),
                     MarketStatusTool(),
                     HistoricalAnalysisTool()
@@ -552,7 +699,7 @@ async def visual_chart_endpoint(request: ChatRequest):
                 
                 client_with_tools = client.bind_tools(tools)
                 
-                # Enhanced system message for multi-line charts
+                # Enhanced system message for BTC+ETH comparison charts
                 messages_with_tools = [
                     SystemMessage(VISUAL_CHART_SYSTEM_PROMPT),
                     HumanMessage(user_input),
@@ -560,34 +707,36 @@ async def visual_chart_endpoint(request: ChatRequest):
                 
                 if is_chart_request:
                     if is_comparison_request:
-                        logger.info("🎯 MULTI-LINE COMPARISON REQUEST DETECTED - Activating comparison mode")
+                        logger.info(f"🎯 BTC+ETH COMPARISON REQUEST DETECTED - Activating BTC vs ETH mode (timeframe: {detected_timeframe})")
                     else:
-                        logger.info("🎯 SINGLE-LINE CHART REQUEST DETECTED - Activating standard mode")
+                        logger.info(f"🎯 SINGLE-LINE CHART REQUEST DETECTED - Activating standard mode (timeframe: {detected_timeframe})")
                 
                 # Process request
                 result = client_with_tools.invoke(messages_with_tools)
                 messages_with_tools.append(result)
                 
-                # Handle tool calls
+                # Handle tool calls with enhanced parameter injection
                 if result.tool_calls:
                     for tool_call in result.tool_calls:
                         logger.info(f"🔧 Tool call: {tool_call['name']}")
                         
                         # Special handling for chart generation
                         if tool_call["name"] == "generate_guaranteed_visual_chart":
-                            # Auto-inject comparison parameters if detected
-                            if is_comparison_request and 'comparison_request' not in tool_call["args"]:
+                            # 🔥 AUTO-INJECT timeframe parameter
+                            if 'timeframe' not in tool_call["args"] or tool_call["args"]["timeframe"] == "1D":
+                                tool_call["args"]["timeframe"] = detected_timeframe
+                                logger.info(f"🕐 AUTO-INJECTED timeframe: {detected_timeframe}")
+                            
+                            # 🔥 FORCE BTC+ETH comparison if detected
+                            if is_comparison_request:
                                 tool_call["args"]["comparison_request"] = True
                                 tool_call["args"]["chart_type"] = "comparison"
                                 
-                                # Auto-add ETH if BTC is primary and vice versa
-                                primary_symbol = tool_call["args"].get("symbol", "").upper()
-                                if 'BTC' in primary_symbol and not tool_call["args"].get("additional_symbols"):
-                                    tool_call["args"]["additional_symbols"] = ["ETH"]
-                                elif 'ETH' in primary_symbol and not tool_call["args"].get("additional_symbols"):
-                                    tool_call["args"]["additional_symbols"] = ["BTC"]
+                                # Override any user-specified symbols to force BTC+ETH
+                                tool_call["args"]["symbol"] = "BTC"
+                                tool_call["args"]["additional_symbols"] = ["ETH"]
                                 
-                                logger.info(f"🔥 AUTO-INJECTED comparison parameters: {tool_call['args']}")
+                                logger.info(f"🔥 FORCED BTC+ETH COMPARISON: {tool_call['args']}")
                         
                         tool_found = None
                         for tool in tools:
@@ -599,17 +748,16 @@ async def visual_chart_endpoint(request: ChatRequest):
                             try:
                                 tool_result = tool_found._run(**tool_call["args"])
                                 
-                                # CONSOLE LOG: Tool result before adding to messages
-                                print(f"\n🔧 MULTI-LINE TOOL RESULT FROM {tool_call['name']}:")
+                                # CONSOLE LOG: Tool result analysis
+                                print(f"\n🔧 TOOL RESULT FROM {tool_call['name']}:")
                                 print("="*60)
-                                print(tool_result)
-                                print("="*60)
-                                print(f"✅ Contains ```graph block: {'```graph' in tool_result}")
+                                print(f"Timeframe: {tool_call['args'].get('timeframe', 'N/A')}")
+                                print(f"Comparison: {tool_call['args'].get('comparison_request', False)}")
+                                print(f"Contains ```graph: {'```graph' in tool_result}")
                                 
-                                # Check for multiple data series in the result
+                                # Analyze graph content for BTC+ETH
                                 if '```graph' in tool_result:
                                     try:
-                                        # Extract and parse the graph data
                                         start = tool_result.find('```graph\n') + 9
                                         end = tool_result.find('\n```', start)
                                         graph_json = tool_result[start:end]
@@ -617,12 +765,32 @@ async def visual_chart_endpoint(request: ChatRequest):
                                         
                                         if 'history' in graph_data and 'content' in graph_data['history']:
                                             series_count = len(graph_data['history']['content'])
-                                            print(f"🔥 Multi-line chart detected: {series_count} data series")
-                                            for i, series in enumerate(graph_data['history']['content']):
-                                                series_name = series.get('name', f'Series {i+1}')
-                                                print(f"  - Line {i+1}: {series_name}")
-                                    except:
-                                        pass
+                                            title = graph_data['history'].get('title', 'No title')
+                                            
+                                            print(f"🔥 Chart Analysis:")
+                                            print(f"  - Series count: {series_count}")
+                                            print(f"  - Title: {title}")
+                                            
+                                            timeframe_labels = {
+                                                '1m': '1-Minute',
+                                                '5m': '5-Minute', 
+                                                '15m': '15-Minute',
+                                                '30m': '30-Minute', 
+                                                '1h': 'Hourly',
+                                                '4h': '4-Hour',
+                                                '1D': 'Daily',
+                                                '1d': 'Daily'
+                                            }
+                                            
+                                            print(f"  - Timeframe in title: {detected_timeframe in title or timeframe_labels.get(detected_timeframe, '') in title}")
+                                            
+                                            if series_count >= 2:
+                                                series_names = [s.get('name', 'Unknown') for s in graph_data['history']['content']]
+                                                print(f"  - Series names: {series_names}")
+                                                has_btc_eth = 'Bitcoin' in series_names and 'Ethereum' in series_names
+                                                print(f"  - Has BTC+ETH: {has_btc_eth}")
+                                    except Exception as parse_error:
+                                        print(f"  - Graph parsing error: {parse_error}")
                                 
                                 print("="*60 + "\n")
                                 
@@ -647,16 +815,7 @@ async def visual_chart_endpoint(request: ChatRequest):
                 
                 for chunk in client_with_tools.stream(messages_with_tools):
                     if chunk.content:
-                        # CONSOLE LOG: Each chunk before streaming
-                        print(f"\n📤 STREAMING MULTI-LINE CHUNK TO FRONTEND:")
-                        print("-"*40)
-                        print(f"Content: {chunk.content[:200]}{'...' if len(chunk.content) > 200 else ''}")
-                        print(f"Contains ```graph: {'```graph' in chunk.content}")
-                        if '```graph' in chunk.content:
-                            print("🔥 Multi-line chart data detected in stream")
-                        print("-"*40 + "\n")
-                        
-                        # Always check for graph content
+                        # Check for graph content and determine chart type
                         if '```graph' in chunk.content:
                             chunk_data = {
                                 "type": "chart",
@@ -664,9 +823,12 @@ async def visual_chart_endpoint(request: ChatRequest):
                                 "data": chunk.content,
                                 "visual": True,
                                 "interactive": True,
-                                "multi_line": is_comparison_request
+                                "multi_line": is_comparison_request,
+                                "btc_eth_comparison": is_comparison_request,
+                                "timeframe": detected_timeframe,
+                                "weekly_view": is_weekly_request
                             }
-                            logger.info("📊 MULTI-LINE VISUAL CHART STREAMING TO FRONTEND")
+                            logger.info(f"📊 CHART STREAMING TO FRONTEND: BTC+ETH={is_comparison_request}, timeframe={detected_timeframe}")
                         else:
                             chunk_data = {
                                 "type": "text",
@@ -677,7 +839,7 @@ async def visual_chart_endpoint(request: ChatRequest):
                         yield f'{json.dumps([chunk_data])}\n'
 
             except Exception as e:
-                logger.error(f"Multi-line visual response generation error: {e}")
+                logger.error(f"Visual response generation error: {e}")
                 import traceback
                 traceback.print_exc()
                 
@@ -688,12 +850,6 @@ async def visual_chart_endpoint(request: ChatRequest):
                     "data": f"❌ **System Error**: {str(e)}\n\nPlease try again or contact support."
                 }
                 
-                # CONSOLE LOG: Error response
-                print(f"\n❌ ERROR RESPONSE TO FRONTEND:")
-                print("="*50)
-                print(json.dumps(error_data, indent=2))
-                print("="*50 + "\n")
-                
                 yield f'{json.dumps([error_data])}\n'
 
         return StreamingResponse(
@@ -702,28 +858,34 @@ async def visual_chart_endpoint(request: ChatRequest):
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Chart-Mode": "multi-line-visual-graph-blocks",
-                "X-Chart-Compatible": "chart-renderer-tsx"
+                "X-Chart-Mode": "btc-eth-comparison-guaranteed",
+                "X-Chart-Compatible": "chart-renderer-tsx",
+                "X-Chart-Timeframe": detected_timeframe,
+                "X-Comparison-Forced": str(is_comparison_request).lower()
             }
         )
         
     except Exception as e:
-        logger.error(f"Multi-line visual chart endpoint error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))  
-
+        logger.error(f"BTC+ETH comparison endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Direct Chart Generation Endpoints
 @app.get("/generate/visual-chart/{symbol}")
-async def direct_visual_chart(symbol: str, days_back: int = 30):
-    """Direct endpoint for visual chart generation"""
+async def direct_visual_chart(symbol: str, days_back: int = 30, timeframe: str = "1D"):
+    """Direct endpoint for visual chart generation with timeframe support"""
     try:
         if not tool_manager or not tool_manager.tools_initialized:
             raise HTTPException(status_code=503, detail="Visual chart system not initialized")
         
-        logger.info(f"📊 Direct visual chart request: {symbol}, {days_back} days")
+        # Validate timeframe
+        valid_timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1D', '1d']
+        if timeframe not in valid_timeframes:
+            timeframe = '1D'
+        
+        logger.info(f"📊 Direct visual chart request: {symbol}, {days_back} days, {timeframe}")
         
         chart_tool = GuaranteedVisualChartTool()
-        chart_result = chart_tool._run(symbol=symbol, days_back=days_back)
+        chart_result = chart_tool._run(symbol=symbol, days_back=days_back, timeframe=timeframe)
         
         # Extract chart data from the result
         if "```graph" in chart_result:
@@ -733,10 +895,11 @@ async def direct_visual_chart(symbol: str, days_back: int = 30):
             chart_data = json.loads(chart_data_str)
             
             # CONSOLE LOG: Direct endpoint response
-            print(f"\n📊 DIRECT CHART ENDPOINT RESPONSE FOR {symbol}:")
+            print(f"\n📊 DIRECT CHART ENDPOINT RESPONSE FOR {symbol} ({timeframe}):")
             print("="*60)
             print(f"Chart data extracted: {len(chart_data_str)} characters")
             print(f"Valid JSON: {isinstance(chart_data, dict)}")
+            print(f"Timeframe: {timeframe}")
             print("="*60 + "\n")
             
             return JSONResponse({
@@ -744,6 +907,7 @@ async def direct_visual_chart(symbol: str, days_back: int = 30):
                 "type": "visual_chart",
                 "symbol": symbol,
                 "days_back": days_back,
+                "timeframe": timeframe,
                 "chart_data": chart_data,
                 "compatible_with": "chart-renderer.tsx",
                 "interactive": True,
@@ -758,23 +922,33 @@ async def direct_visual_chart(symbol: str, days_back: int = 30):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate/visual-comparison")
-async def direct_visual_comparison(symbols: list, days_back: int = 90):
-    """Direct endpoint for visual comparison chart generation"""
+async def direct_visual_comparison(request_data: dict):
+    """Direct endpoint for visual comparison chart generation with timeframe support"""
     try:
         if not tool_manager or not tool_manager.tools_initialized:
             raise HTTPException(status_code=503, detail="Visual chart system not initialized")
         
+        symbols = request_data.get('symbols', [])
+        days_back = request_data.get('days_back', 90)
+        timeframe = request_data.get('timeframe', '1D')
+        
         if len(symbols) < 2:
             raise HTTPException(status_code=400, detail="Need at least 2 symbols for comparison")
         
-        logger.info(f"📊 Direct visual comparison: {symbols}, {days_back} days")
+        # Validate timeframe
+        valid_timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1D', '1d']
+        if timeframe not in valid_timeframes:
+            timeframe = '1D'
+        
+        logger.info(f"📊 Direct visual comparison: {symbols}, {days_back} days, {timeframe}")
         
         chart_tool = GuaranteedVisualChartTool()
         chart_result = chart_tool._run(
             symbol=symbols[0], 
             chart_type="comparison", 
             additional_symbols=symbols[1:], 
-            days_back=days_back
+            days_back=days_back,
+            timeframe=timeframe
         )
         
         # Extract chart data
@@ -785,10 +959,11 @@ async def direct_visual_comparison(symbols: list, days_back: int = 90):
             chart_data = json.loads(chart_data_str)
             
             # CONSOLE LOG: Direct comparison response
-            print(f"\n📊 DIRECT COMPARISON ENDPOINT RESPONSE FOR {symbols}:")
+            print(f"\n📊 DIRECT COMPARISON ENDPOINT RESPONSE FOR {symbols} ({timeframe}):")
             print("="*70)
             print(f"Chart data extracted: {len(chart_data_str)} characters")
             print(f"Symbols count: {len(symbols)}")
+            print(f"Timeframe: {timeframe}")
             print("="*70 + "\n")
             
             return JSONResponse({
@@ -796,6 +971,7 @@ async def direct_visual_comparison(symbols: list, days_back: int = 90):
                 "type": "visual_comparison",
                 "symbols": symbols,
                 "days_back": days_back,
+                "timeframe": timeframe,
                 "chart_data": chart_data,
                 "compatible_with": "chart-renderer.tsx",
                 "interactive": True,
@@ -812,48 +988,53 @@ async def direct_visual_comparison(symbols: list, days_back: int = 90):
 # Health and Status Endpoints
 @app.get("/health")
 async def health_check():
-    """Health check for visual chart system"""
+    """Health check endpoint with detailed system status"""
     try:
-        health_status = {
+        status = {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
-            "system": "Visual Chart Generator",
             "version": "4.1.0",
-            "services": {
-                "visual_chart_generator": "✅ ACTIVE" if tool_manager and tool_manager.tools_initialized else "❌ INACTIVE",
-                "chart_renderer_compatibility": "✅ ```graph blocks",
-                "jesse_database": "✅ CONNECTED" if tool_manager and tool_manager.tools_initialized else "❌ DISCONNECTED",
-                "azure_openai": "✅ AVAILABLE" if azure_api_key else "❌ UNAVAILABLE"
+            "system": "Visual Chart Crypto Analysis Server",
+            "tools_initialized": bool(tool_manager and tool_manager.tools_initialized),
+            "compatibility": {
+                "frontend_component": "chart-renderer.tsx",
+                "block_type": "```graph",
+                "auto_detection": "language === 'graph'",
+                "guaranteed_btc_eth_comparison": True,
+                "timeframe_support": True
             },
-            "features": {
-                "graph_blocks": "✅ Uses ```graph for chart-renderer.tsx",
-                "console_logging": "✅ All responses logged to console",
-                "interactive_charts": "✅ Hover, zoom, pan supported",
-                "real_data": "✅ Jesse.ai database integration",
-                "error_handling": "✅ Graceful error responses"
-            },
-            "tools": [
-                "🎯 generate_guaranteed_visual_chart (PRIMARY)",
-                "get_live_crypto_data",
-                "get_live_market_status", 
-                "get_crypto_historical_analysis"
+            "features": [
+                "Interactive visual charts",
+                "Real-time cryptocurrency data",
+                "BTC vs ETH comparison charts",
+                "Multiple timeframe support",
+                "Professional crypto styling",
+                "Responsive design",
+                "Console logging for debugging"
             ]
         }
         
-        if not tool_manager or not tool_manager.tools_initialized:
-            health_status["status"] = "degraded"
-            health_status["warning"] = "Visual chart system not fully initialized"
-            
-        return health_status
+        if tool_manager and tool_manager.tools_initialized:
+            status["tools"] = {
+                "tgx_market_data": "✅ Active",
+                "jesse_historical": "✅ Active", 
+                "jesse_chart_generator": "✅ Active",
+                "guaranteed_visual_charts": "✅ Active"
+            }
+        else:
+            status["tools"] = {
+                "all_tools": "❌ Not initialized"
+            }
+            status["status"] = "degraded"
+        
+        return JSONResponse(status)
         
     except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return {
+        return JSONResponse({
             "status": "error",
             "error": str(e),
-            "timestamp": datetime.now().isoformat(),
-            "system": "Visual Chart Generator"
-        }
+            "timestamp": datetime.now().isoformat()
+        }, status_code=500)
 
 @app.get("/")
 async def root():

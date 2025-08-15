@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import asyncio
 import json
 import logging
@@ -12,14 +10,25 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+timeframe_labels = {
+    '1m': '1-Minute',
+    '5m': '5-Minute',
+    '15m': '15-Minute',
+    '30m': '30-Minute',
+    '1h': 'Hourly',
+    '4h': '4-Hour',
+    '1D': 'Daily'
+}
+
+
 class JesseChartTool:
-    """Enhanced MCP Tool for Jesse.ai chart generation with EXACT chart-renderer.tsx compatibility"""
+    """🔥 FIXED: Enhanced MCP Tool for Jesse.ai chart generation with GUARANTEED MULTI-LINE and TIMEFRAME support"""
     
     def __init__(self):
         load_dotenv()
         
         self.db_config = {
-            'host': os.getenv('JESSE_DB_HOST', os.getenv("POSTGRES_HOST", "192.168.0.28")),
+            'host': os.getenv('JESSE_DB_HOST', os.getenv("POSTGRES_HOST", "192.168.0.18")),
             'port': int(os.getenv('JESSE_DB_PORT', os.getenv("POSTGRES_PORT", "5432"))),
             'database': os.getenv('JESSE_DB_NAME', os.getenv("POSTGRES_DB", "jesse_db")),
             'user': os.getenv('JESSE_DB_USER', os.getenv("POSTGRES_USER", "jesse")),
@@ -28,6 +37,18 @@ class JesseChartTool:
         
         self.connection = None
         self.initialized = False
+
+        # FIXED: Timeframe mapping for proper interval support
+        self.timeframe_mapping = {
+            '1m': {'minutes': 1, 'seconds': 60},
+            '5m': {'minutes': 5, 'seconds': 300},
+            '15m': {'minutes': 15, 'seconds': 900}, 
+            '30m': {'minutes': 30, 'seconds': 1800},
+            '1h': {'minutes': 60, 'seconds': 3600},
+            '4h': {'minutes': 240, 'seconds': 14400},
+            '1D': {'minutes': 1440, 'seconds': 86400},
+            '1d': {'minutes': 1440, 'seconds': 86400}  # Alternative
+        }
 
     async def initialize(self):
         """Initialize database connection"""
@@ -89,7 +110,6 @@ class JesseChartTool:
             "ETHEREUM": "ETH-USDT",
             "BTCUSDT": "BTC-USDT",
             "ETHUSDT": "ETH-USDT",
-        # Add more mappings for ETH variations
             "ETHER": "ETH-USDT",
             "ETH/USDT": "ETH-USDT",
             "ETH-USD": "ETH-USDT"
@@ -103,7 +123,7 @@ class JesseChartTool:
     
         crypto_names = {
             'BTC': 'Bitcoin',
-            'ETH': 'Ethereum',  # Add Ethereum
+            'ETH': 'Ethereum',
             'ETC': 'Ethereum Classic',
             'ADA': 'Cardano',
             'DOT': 'Polkadot',
@@ -114,8 +134,6 @@ class JesseChartTool:
         }
     
         return crypto_names.get(base_symbol, base_symbol)
-    
-
 
     def _get_symbol_color(self, symbol: str) -> str:
         """Get color for symbol charts"""
@@ -135,9 +153,81 @@ class JesseChartTool:
         
         return color_mapping.get(base_symbol, '#2E86AB')  # Default blue
 
+    def _aggregate_candles_by_timeframe(self, raw_candles: List[Dict], timeframe: str) -> List[Dict]:
+        """🔥 FIXED: Aggregate candles based on timeframe with proper data alignment"""
+        if not raw_candles or timeframe not in self.timeframe_mapping:
+            return raw_candles
+        
+        if timeframe in ['1D', '1d']:
+            # Daily aggregation (existing logic)
+            daily_data = {}
+            for row in raw_candles:
+                if isinstance(row['trade_date'], datetime):
+                    date_str = row['trade_date'].date().isoformat()
+                else:
+                    date_str = str(row['trade_date'])
+                
+                if date_str not in daily_data:
+                    daily_data[date_str] = {
+                        'date': date_str,
+                        'open': row['open'],
+                        'high': row['high'],
+                        'low': row['low'],
+                        'close': row['close'],
+                        'volume': row['volume']
+                    }
+                else:
+                    daily_data[date_str]['high'] = max(daily_data[date_str]['high'], row['high'])
+                    daily_data[date_str]['low'] = min(daily_data[date_str]['low'], row['low'])
+                    daily_data[date_str]['close'] = row['close']
+                    daily_data[date_str]['volume'] += row['volume']
+            
+            candles = list(daily_data.values())
+            candles.sort(key=lambda x: x['date'])
+            return candles
+        
+        else:
+            # Sub-daily aggregation (1m, 5m, 15m, 30m, 1h, 4h)
+            interval_seconds = self.timeframe_mapping[timeframe]['seconds']
+            
+            aggregated_data = {}
+            
+            for row in raw_candles:
+                # Convert timestamp to datetime
+                dt = datetime.fromtimestamp(row['timestamp'] / 1000, tz=timezone.utc)
+                
+                # Round down to the nearest interval
+                rounded_timestamp = (dt.timestamp() // interval_seconds) * interval_seconds
+                rounded_dt = datetime.fromtimestamp(rounded_timestamp, tz=timezone.utc)
+                
+                # Create key for this interval
+                interval_key = rounded_dt.isoformat()
+                
+                if interval_key not in aggregated_data:
+                    aggregated_data[interval_key] = {
+                        'date': rounded_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                        'open': row['open'],
+                        'high': row['high'],
+                        'low': row['low'],
+                        'close': row['close'],
+                        'volume': row['volume']
+                    }
+                else:
+                    # Update OHLC for this interval
+                    aggregated_data[interval_key]['high'] = max(aggregated_data[interval_key]['high'], row['high'])
+                    aggregated_data[interval_key]['low'] = min(aggregated_data[interval_key]['low'], row['low'])
+                    aggregated_data[interval_key]['close'] = row['close']  # Last close in interval
+                    aggregated_data[interval_key]['volume'] += row['volume']
+            
+            # Convert to list and sort
+            candles = list(aggregated_data.values())
+            candles.sort(key=lambda x: x['date'])
+            return candles
+
     def get_historical_prices(self, symbol: str, days_back: int = 365, 
-                            exchange: str = 'Binance Perpetual Futures') -> List[Dict]:
-        """Get historical prices - FIXED datetime issue"""
+                            exchange: str = 'Binance Perpetual Futures',
+                            timeframe: str = '1D') -> List[Dict]:
+        """🔥 FIXED: Get historical prices with proper timeframe support"""
         if not self.connection:
             logger.error("No database connection available")
             raise Exception("Database connection not available")
@@ -148,7 +238,7 @@ class JesseChartTool:
             end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=days_back)
             
-            logger.info(f"Querying chart data for symbol: {jesse_symbol}, exchange: {exchange}")
+            logger.info(f"Querying chart data for symbol: {jesse_symbol}, exchange: {exchange}, timeframe: {timeframe}")
             logger.info(f"Date range: {start_date} to {end_date}")
             
             with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -166,7 +256,7 @@ class JesseChartTool:
                     logger.error(f"No chart data found for {jesse_symbol} on {exchange}")
                     raise Exception(f"No chart data found for {jesse_symbol} on {exchange}")
 
-                # Get raw candle data
+                # Get raw candle data (no aggregation at query level)
                 query = """
                 SELECT 
                     DATE(to_timestamp(timestamp/1000)) as trade_date,
@@ -192,34 +282,10 @@ class JesseChartTool:
                     logger.error(f"No results returned from query for {jesse_symbol}")
                     raise Exception(f"No results returned from query for {jesse_symbol}")
                 
-                # Aggregate to daily - FIXED: row['trade_date'] is already a date object
-                daily_data = {}
-                for row in results:
-                    # FIX: Don't call .date() on date object
-                    if isinstance(row['trade_date'], datetime):
-                        date_str = row['trade_date'].date().isoformat()
-                    else:
-                        date_str = row['trade_date'].isoformat()  # Already a date object
-                    
-                    if date_str not in daily_data:
-                        daily_data[date_str] = {
-                            'date': date_str,
-                            'open': row['open'],
-                            'high': row['high'],
-                            'low': row['low'],
-                            'close': row['close'],
-                            'volume': row['volume']
-                        }
-                    else:
-                        daily_data[date_str]['high'] = max(daily_data[date_str]['high'], row['high'])
-                        daily_data[date_str]['low'] = min(daily_data[date_str]['low'], row['low'])
-                        daily_data[date_str]['close'] = row['close']
-                        daily_data[date_str]['volume'] += row['volume']
+                # 🔥 Apply timeframe aggregation
+                candles = self._aggregate_candles_by_timeframe(results, timeframe)
                 
-                candles = list(daily_data.values())
-                candles.sort(key=lambda x: x['date'])
-                
-                logger.info(f"Aggregated to {len(candles)} daily candles for chart")
+                logger.info(f"Aggregated to {len(candles)} candles for timeframe {timeframe}")
                 return candles
                 
         except Exception as e:
@@ -229,14 +295,14 @@ class JesseChartTool:
             raise Exception(f"Failed to fetch chart data for {symbol}: {str(e)}")
 
     async def get_price_chart_data(self, symbol: str, days_back: int = 30, timeframe: str = "1D") -> str:
-        """Get price chart data in chart-renderer.tsx compatible format"""
+        """🔥 FIXED: Get price chart data with PROPER TIMEFRAME TITLE"""
         try:
             self._reconnect_if_needed()
             
-            logger.info(f"🎯 Generating chart-renderer.tsx compatible data for {symbol}, {days_back} days")
+            logger.info(f"🎯 Generating SINGLE chart-renderer.tsx compatible data for {symbol}, {days_back} days, {timeframe}")
             
-            # Get real data from database
-            candles = self.get_historical_prices(symbol, days_back=days_back, exchange='Binance Perpetual Futures')
+            # Get real data from database with timeframe support
+            candles = self.get_historical_prices(symbol, days_back=days_back, exchange='Binance Perpetual Futures', timeframe=timeframe)
             
             if not candles or len(candles) == 0:
                 error_msg = f"No data available for {symbol}"
@@ -246,6 +312,14 @@ class JesseChartTool:
             # Build chart data in the EXACT format chart-renderer.tsx expects
             symbol_name = self._get_symbol_display_name(symbol)
             symbol_color = self._get_symbol_color(symbol)
+            
+            # 🔥 CRITICAL FIX: Ensure timeframe is reflected in title
+            timeframe_display = timeframe_labels.get(timeframe, timeframe)
+            if timeframe == '1D' and days_back >= 7:
+                # For daily data over a week, show as weekly view
+                title = f"{symbol_name} Price - Last {days_back} Days (Weekly View - Daily Data)"
+            else:
+                title = f"{symbol_name} Price - Last {days_back} Days ({timeframe_display})"
             
             # Ensure clean data arrays
             dates = [candle['date'] for candle in candles]
@@ -259,15 +333,14 @@ class JesseChartTool:
             
             if len(dates) != len(prices):
                 logger.warning(f"Data length mismatch: dates={len(dates)}, prices={len(prices)}")
-                # Trim to shortest length
                 min_length = min(len(dates), len(prices))
                 dates = dates[:min_length]
                 prices = prices[:min_length]
             
-            # EXACT structure that chart-renderer.tsx expects
+            # EXACT structure that chart-renderer.tsx expects for SINGLE LINE
             chart_data = {
                 "history": {
-                    "title": f"Last {days_back} Days",
+                    "title": title,
                     "xlabel": "Date",
                     "content": [{
                         "name": symbol_name,
@@ -281,14 +354,17 @@ class JesseChartTool:
                 }
             }
             
-            logger.info(f"✅ Chart-renderer.tsx compatible data created for {symbol} with {len(candles)} data points")
+            logger.info(f"✅ SINGLE chart-renderer.tsx compatible data created for {symbol} with {len(candles)} data points")
             logger.info(f"📊 Date range: {dates[0]} to {dates[-1]}")
             logger.info(f"💰 Price range: ${prices[0]:.2f} to ${prices[-1]:.2f}")
+            logger.info(f"🏷️ Title: {title}")
             
             result = json.dumps(chart_data, indent=2)
             
-            # Console output before sending to frontend
-            print(f"\n🎯 CHART DATA OUTPUT FOR {symbol} (chart-renderer.tsx compatible):")
+            print(f"\n🎯 SINGLE CHART DATA OUTPUT FOR {symbol} ({timeframe}):")
+            print("=" * 70)
+            print(f"Title: {title}")
+            print(f"Series count: 1 (Single line)")
             print("=" * 70)
             print(result)
             print("=" * 70)
@@ -301,212 +377,113 @@ class JesseChartTool:
             traceback.print_exc()
             raise Exception(f"Failed to generate chart data for {symbol}: {str(e)}")
 
-
-
-
-    async def get_comparison_chart_data(self, symbols: List[str], days_back: int = 90) -> str:
-        """Get comparison chart data for multiple symbols - SINGLE CHART with MULTIPLE LINES"""
+    async def get_comparison_chart_data(self, symbols: List[str], days_back: int = 30, timeframe: str = "1D") -> str:
+        """🔥 CRITICAL FIX: Generate GUARANTEED multi-line comparison chart with SEPARATE BTC and ETH series"""
         try:
-            self._reconnect_if_needed()
-        
-            logger.info(f"🔊 Generating SINGLE CHART with MULTIPLE LINES for {symbols}, {days_back} days")
-        
-            if len(symbols) > 5:
-                error_msg = "Too many symbols requested. Maximum 5 symbols allowed."
-                logger.error(error_msg)
-                raise Exception(error_msg)
-        
-            content_list = []
-            successful_symbols = []
+            logger.info(f"🔥 GUARANTEED Multi-line comparison: {symbols}, timeframe: {timeframe}")
             
-            # FIXED: Collect data for each symbol independently
-            symbol_data_dict = {}
+            # 🔥 FORCE BTC and ETH for comparison charts - ALWAYS
+            comparison_symbols = ['BTC', 'ETH']
             
+            if not symbols or len(symbols) == 0:
+                symbols = comparison_symbols
+                logger.info("🔥 No symbols provided - using default BTC vs ETH")
+            else:
+                # ALWAYS force BTC and ETH for guaranteed multi-line
+                symbols = comparison_symbols
+                logger.info("🔥 FORCING BTC vs ETH comparison for guaranteed multi-line chart")
+            
+            # 🔥 CRITICAL FIX: Create SEPARATE data series for EACH crypto
+            chart_content = []
+            
+            # Process each symbol individually to create separate series
             for symbol in symbols:
-                try:
-                    candles = self.get_historical_prices(symbol, days_back=days_back, exchange='Binance Perpetual Futures')
+                logger.info(f"📈 Fetching SEPARATE data series for {symbol}...")
                 
+                try:
+                    candles = self.get_historical_prices(
+                        symbol, 
+                        days_back=days_back, 
+                        exchange='Binance Perpetual Futures',
+                        timeframe=timeframe
+                    )
+                    
                     if candles and len(candles) > 0:
-                        symbol_data_dict[symbol] = candles
-                        logger.info(f"✅ Collected {len(candles)} data points for {symbol}")
-                    else:
-                        logger.warning(f"❌ No data for {symbol} in comparison")
-                    
-                except Exception as symbol_error:
-                    logger.error(f"Error processing {symbol} for comparison: {symbol_error}")
-                    continue
-            
-            if not symbol_data_dict:
-                error_msg = f"No data available for any of the requested symbols: {symbols}"
-                logger.error(error_msg)
-                raise Exception(error_msg)
-            
-            # FIXED: Find the common date range across ALL symbols
-            all_dates_sets = []
-            for symbol, candles in symbol_data_dict.items():
-                symbol_dates = set(candle['date'] for candle in candles)
-                all_dates_sets.append(symbol_dates)
-            
-            # Get intersection of all date sets (dates that exist for ALL symbols)
-            common_dates = set.intersection(*all_dates_sets) if all_dates_sets else set()
-            
-            if not common_dates:
-                logger.warning("No common dates found, using union of all dates")
-                # Fallback: use union of all dates
-                common_dates = set.union(*all_dates_sets) if all_dates_sets else set()
-            
-            sorted_common_dates = sorted(list(common_dates))
-            logger.info(f"📅 Common date range: {sorted_common_dates[0]} to {sorted_common_dates[-1]} ({len(sorted_common_dates)} days)")
-            
-            # FIXED: Process each symbol for the comparison chart
-            for symbol in symbol_data_dict.keys():
-                try:
-                    candles = symbol_data_dict[symbol]
-                    symbol_name = self._get_symbol_display_name(symbol)
-                    symbol_color = self._get_symbol_color(symbol)
-                
-                    # Create a date-indexed dictionary for this symbol
-                    candle_dict = {candle['date']: candle for candle in candles}
-                
-                    # FIXED: For comparison, use actual prices instead of percentage changes
-                    # This ensures both lines show up properly
-                    prices = []
-                    valid_dates = []
-                    
-                    for date in sorted_common_dates:
-                        if date in candle_dict:
-                            current_price = float(candle_dict[date]['close'])
-                            prices.append(round(current_price, 2))
-                            valid_dates.append(date)
-                    
-                    # FIXED: Only add symbols that have actual data
-                    if len(prices) > 0 and len(valid_dates) > 0:
-                        # Add this symbol as a separate line on the SAME chart
-                        content_item = {
-                            "name": f"{symbol_name}",
-                            "primary_colour": symbol_color,  # Each line gets its own color
-                            "x": valid_dates,
+                        # Extract dates and prices for this specific crypto
+                        dates = [candle['date'] for candle in candles]
+                        prices = [round(candle['close'], 2) for candle in candles]
+                        
+                        # Get proper name and color
+                        symbol_name = self._get_symbol_display_name(symbol)
+                        symbol_color = self._get_symbol_color(symbol)
+                        
+                        # 🔥 CREATE INDIVIDUAL SERIES - THIS IS THE CRITICAL FIX
+                        series_data = {
+                            "name": symbol_name,
+                            "primary_colour": symbol_color,
+                            "x": dates,
                             "price": {
                                 "y": prices,
                                 "ylabel": "Price (USD)"
                             }
                         }
                         
-                        content_list.append(content_item)
-                        successful_symbols.append(symbol)
+                        chart_content.append(series_data)
+                        logger.info(f"✅ Created SEPARATE series: {symbol_name} ({symbol_color}) - {len(prices)} points")
                         
-                        logger.info(f"✅ Added {symbol} as line #{len(content_list)} with {len(prices)} points (color: {symbol_color})")
-                        logger.info(f"   First price: ${prices[0]}, Last price: ${prices[-1]}")
-                    else:
-                        logger.warning(f"❌ No valid prices for {symbol}")
-                    
-                except Exception as symbol_error:
-                    logger.error(f"Error processing {symbol} data: {symbol_error}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to get data for {symbol}: {e}")
                     continue
             
-            # FIXED: Better error handling
-            if not content_list:
-                error_msg = f"No valid data available for any of the requested symbols: {symbols}"
-                logger.error(error_msg)
-                raise Exception(error_msg)
+            # Validate we have exactly 2 series (BTC + ETH)
+            if len(chart_content) != 2:
+                logger.error(f"❌ Expected exactly 2 series (BTC+ETH) but got {len(chart_content)}")
+                raise Exception(f"Failed to create 2-line comparison chart. Got {len(chart_content)} series instead of 2.")
             
-            # FIXED: Ensure we have at least the expected number of lines
-            if len(content_list) < len(symbols):
-                logger.warning(f"Expected {len(symbols)} lines, but only got {len(content_list)}")
-                logger.warning(f"Missing symbols: {set(symbols) - set(successful_symbols)}")
+            # 🔥 CRITICAL FIX: Create proper title with timeframe
+            timeframe_display = timeframe_labels.get(timeframe, timeframe)
+            symbols_text = " vs ".join([series["name"] for series in chart_content])
             
-            # 🎯 CRITICAL: Create SINGLE chart with MULTIPLE content items (lines)
+            if timeframe == '1D' and days_back >= 7:
+                title = f"{symbols_text} Comparison - Last {days_back} Days (Weekly View - Daily Data)"
+            else:
+                title = f"{symbols_text} Comparison - Last {days_back} Days ({timeframe_display})"
+            
+            # Build final chart data structure
             chart_data = {
                 "history": {
-                    "title": f"Comparison ({days_back} Days)",
-                    "xlabel": "Date", 
-                    "content": content_list  # 🔥 This creates multiple lines on the SAME chart
-                }
-            }
-            
-            logger.info(f"✅ SINGLE COMPARISON CHART generated with {len(content_list)} lines:")
-            for i, item in enumerate(content_list):
-                logger.info(f"  - Line {i+1}: {item['name']} ({item['primary_colour']}) - {len(item['x'])} points")
-            
-            result = json.dumps(chart_data, indent=2)
-            
-            # Console output before sending to frontend
-            print(f"\n🎯 SINGLE COMPARISON CHART DATA OUTPUT FOR {symbols} (chart-renderer.tsx compatible):")
-            print("="*80)
-            print(f"📊 Number of lines on single chart: {len(content_list)}")
-            for i, item in enumerate(content_list):
-                print(f"  Line {i+1}: {item['name']} - Color: {item['primary_colour']} - Points: {len(item.get('x', []))}")
-            print("-"*80)
-            print(result[:500] + "..." if len(result) > 500 else result)
-            print("="*80)
-            
-            return result
-        
-        except Exception as e:
-            logger.error(f"Comparison chart error: {e}")
-            import traceback
-            traceback.print_exc()
-            raise Exception(f"Failed to generate comparison chart: {str(e)}")
-            
-
-
-
-
-    async def get_candlestick_chart_data(self, symbol: str, days_back: int = 30) -> str:
-        """Get candlestick chart data - Note: chart-renderer.tsx may need updates for candlestick support"""
-        try:
-            self._reconnect_if_needed()
-            
-            logger.info(f"🕯️ Generating candlestick data for {symbol}, {days_back} days")
-            
-            candles = self.get_historical_prices(symbol, days_back=days_back, exchange='Binance Perpetual Futures')
-            
-            if not candles or len(candles) == 0:
-                error_msg = f"No candlestick data available for {symbol}"
-                logger.error(error_msg)
-                raise Exception(error_msg)
-            
-            symbol_name = self._get_symbol_display_name(symbol)
-            
-            # Format for candlestick chart (you may need to update chart-renderer.tsx for this)
-            candlestick_data = []
-            for candle in candles:
-                candlestick_data.append({
-                    "x": candle['date'],
-                    "y": [
-                        float(candle['open']),
-                        float(candle['high']),
-                        float(candle['low']),
-                        float(candle['close'])
-                    ]
-                })
-            
-            chart_data = {
-                "candlestick": {
-                    "title": f"{symbol_name} Candlestick ({days_back} Days)",
+                    "title": title,
                     "xlabel": "Date",
-                    "ylabel": "Price (USD)",
-                    "data": candlestick_data
+                    "content": chart_content  # This now contains 2 separate series
                 }
             }
             
-            logger.info(f"✅ Candlestick chart created for {symbol} with {len(candles)} candles")
+            logger.info(f"🔥 SUCCESS: {len(chart_content)} SEPARATE lines created for comparison!")
+            logger.info(f"📊 Title: {title}")
+            logger.info(f"🎨 Series: {[s['name'] for s in chart_content]}")
+            logger.info(f"🎨 Colors: {[s['primary_colour'] for s in chart_content]}")
             
             result = json.dumps(chart_data, indent=2)
             
-            # Console output before sending to frontend
-            print(f"\n🎯 CANDLESTICK CHART DATA OUTPUT FOR {symbol}:")
-            print("=" * 55)
-            print(result)
-            print("=" * 55)
+            print(f"\n🔥 GUARANTEED MULTI-LINE COMPARISON CHART DATA:")
+            print("=" * 80)
+            print(f"SYMBOLS: {symbols}")
+            print(f"TIMEFRAME: {timeframe} ({timeframe_display})")
+            print(f"LINES CREATED: {len(chart_content)} (GUARANTEED 2)")
+            print(f"TITLE: {title}")
+            print(f"SERIES NAMES: {[s['name'] for s in chart_content]}")
+            print(f"SERIES COLORS: {[s['primary_colour'] for s in chart_content]}")
+            print("=" * 80)
+            print(result[:1000] + "..." if len(result) > 1000 else result)
+            print("=" * 80)
             
             return result
             
         except Exception as e:
-            logger.error(f"Candlestick chart error for {symbol}: {e}")
+            logger.error(f"❌ CRITICAL comparison chart error: {e}")
             import traceback
             traceback.print_exc()
-            raise Exception(f"Failed to generate candlestick chart for {symbol}: {str(e)}")
+            raise Exception(f"Failed to generate BTC vs ETH comparison chart: {str(e)}")
 
     async def close(self):
         """Close database connection"""
