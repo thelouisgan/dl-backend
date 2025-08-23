@@ -54,13 +54,16 @@ class ChatRequest(BaseModel):
 # === MCP Tool Wrappers ===
 class MCPToolManager:
     def __init__(self):
+        token = os.getenv("TGX_API_TOKEN")
+        secret_key = os.getenv("TGX_API_SECRET_KEY")
+
+        if token is None or secret_key is None:
+            raise ValueError("TGX_API_TOKEN and TGX_API_SECRET_KEY must be set in environment.")
+        
         self.tgx_tool = TGXMarketDataTool()
         self.jesse_tool = JesseHistoricalTool()
         self.jesse_chart_tool = JesseChartTool()
-        self.tgx_trading_tool = TGXLiveTradingTool(
-            token="TGX_TOKEN",
-            secret_key="TGX_SECRET"
-        )
+        self.tgx_trading_tool = TGXLiveTradingTool(token, secret_key)
         self.tools_initialized = False
         
     async def initialize(self):

@@ -2,8 +2,8 @@ import requests, time, hashlib, urllib.parse, json
 import pandas as pd
 
 BASE_URL = "https://api.tgx.finance"
-TOKEN = "TGX_TOKEN"
-SECRET_KEY = "TGX_SECRET"
+TOKEN = "TOKEN_HERE"
+SECRET_KEY = "SECRET_HERE"
 ENCRYPTED_FUND_PASSWORD = "your_encrypted_fund_password_here"
 CONTRACT_CODE = "BTCUSDT"
 
